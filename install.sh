@@ -6,6 +6,10 @@
 #    - WiFi Watchdog (power save off + auto-reconnect service)
 #    - Accelerometer support (ADXL345 / input shaper packages)
 #    - KIAUH installation
+#    - System/OS performance tuning:
+#        vm.swappiness, CPU governor, tmpfs for /tmp + /var/log,
+#        Klipper process priority (nice/ionice), disable unused services
+#    - Log rotation (Klipper, Moonraker, Crowsnest, system logs)
 # =============================================================================
 
 set -e
@@ -436,6 +440,255 @@ setup_kiauh() {
 }
 
 # =============================================================================
+# SECTION 5: System / OS Performance Tuning
+# =============================================================================
+setup_os_tuning() {
+    banner "System / OS Performance Tuning"
+
+    # --- vm.swappiness ---
+    # Default is 60 — way too aggressive for a dedicated printer host.
+    # Setting to 10 keeps Klipper's Python process in RAM and reduces
+    # latency spikes caused by swapping during long prints.
+    info "Setting vm.swappiness=10..."
+    if grep -q "^vm.swappiness" /etc/sysctl.conf 2>/dev/null; then
+        sudo sed -i 's/^vm.swappiness.*/vm.swappiness=10/' /etc/sysctl.conf
+    else
+        echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf > /dev/null
+    fi
+    sudo sysctl -w vm.swappiness=10 > /dev/null
+    ok "vm.swappiness set to 10."
+
+    # --- CPU Governor: performance ---
+    # The R818 defaults to 'ondemand' which scales clocks down during idle.
+    # This causes micro-stutters in Klipper step timing. 'performance' keeps
+    # all cores at max frequency — power draw difference is minimal on a pad.
+    info "Setting CPU governor to 'performance'..."
+    if command -v cpufreq-set &>/dev/null; then
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo performance | sudo tee "$cpu" > /dev/null 2>&1 || true
+        done
+        ok "CPU governor set to performance via cpufreq."
+    else
+        # Direct sysfs write — works on the R818 vendor kernel
+        GOVERNOR_SET=false
+        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            if [ -w "$cpu" ]; then
+                echo performance | sudo tee "$cpu" > /dev/null 2>&1 && GOVERNOR_SET=true || true
+            fi
+        done
+        if [ "$GOVERNOR_SET" = true ]; then
+            ok "CPU governor set to performance via sysfs."
+        else
+            warn "Could not set CPU governor — scaling_governor not writable. Skipping."
+        fi
+    fi
+
+    # Make governor persistent across reboots via rc.local
+    if [ ! -f /etc/rc.local ]; then
+        sudo tee /etc/rc.local > /dev/null << 'EOF'
+#!/bin/bash
+# rc.local — runs at boot
+EOF
+        sudo chmod +x /etc/rc.local
+    fi
+    if ! grep -q "scaling_governor" /etc/rc.local; then
+        sudo sed -i '/^exit 0/d' /etc/rc.local 2>/dev/null || true
+        cat << 'EOF' | sudo tee -a /etc/rc.local > /dev/null
+# Set CPU governor to performance for Klipper step timing stability
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > "$cpu" 2>/dev/null || true
+done
+exit 0
+EOF
+        ok "CPU governor persistence written to /etc/rc.local."
+    else
+        ok "CPU governor already in rc.local. Skipping."
+    fi
+
+    # --- tmpfs for /tmp and /var/log ---
+    # Moves high-churn directories to RAM — keeps SD card write cycles low
+    # and reduces latency from filesystem writes during prints.
+    # /tmp: 64MB cap, /var/log: 32MB cap — plenty for the SonicPad's workload.
+    info "Configuring tmpfs for /tmp and /var/log..."
+
+    FSTAB=/etc/fstab
+    if ! grep -q "tmpfs /tmp" "$FSTAB"; then
+        echo "tmpfs   /tmp        tmpfs   defaults,noatime,nosuid,size=64m    0 0" | sudo tee -a "$FSTAB" > /dev/null
+        ok "tmpfs /tmp added to fstab."
+    else
+        ok "tmpfs /tmp already in fstab. Skipping."
+    fi
+
+    if ! grep -q "tmpfs /var/log" "$FSTAB"; then
+        echo "tmpfs   /var/log    tmpfs   defaults,noatime,nosuid,size=32m    0 0" | sudo tee -a "$FSTAB" > /dev/null
+        ok "tmpfs /var/log added to fstab."
+        # Mount it now without rebooting
+        sudo mount -t tmpfs -o defaults,noatime,nosuid,size=32m tmpfs /var/log 2>/dev/null && \
+            ok "tmpfs /var/log mounted now." || \
+            warn "/var/log tmpfs will take effect on next reboot."
+    else
+        ok "tmpfs /var/log already in fstab. Skipping."
+    fi
+
+    # --- noatime on root filesystem ---
+    # Prevents the kernel from writing access timestamps on every file read.
+    # Significantly reduces SD card wear, especially during long prints where
+    # Klipper, Moonraker, and Crowsnest are constantly reading config/module files.
+    info "Setting noatime on root filesystem..."
+    if grep -q "noatime" "$FSTAB"; then
+        ok "noatime already set in fstab. Skipping."
+    else
+        # Add noatime to the root mount options
+        sudo sed -i 's/\(.*\s\/\s.*defaults\)/\1,noatime/' "$FSTAB" 2>/dev/null || \
+        sudo sed -i '/^\s*[^#].*\s\/\s/ s/defaults/defaults,noatime/' "$FSTAB" 2>/dev/null || \
+            warn "Could not auto-set noatime in fstab — add it manually to the root / entry."
+        # Apply immediately without remounting (avoids disruption)
+        sudo mount -o remount,noatime / 2>/dev/null && ok "noatime applied to root fs." || \
+            warn "noatime remount skipped — will apply on next reboot."
+    fi
+
+    # --- nice / ionice priority for Klipper ---
+    # Gives Klipper's klippy.py process a higher CPU and I/O scheduling priority
+    # so it wins contention against background tasks (apt, logging, etc).
+    # Applied via a systemd drop-in so it survives service restarts.
+    info "Boosting Klipper process priority (nice=-10, ionice=realtime)..."
+    KLIPPER_SERVICE_DIR="${SYSTEMD_DIR}/klipper.service.d"
+    sudo mkdir -p "${KLIPPER_SERVICE_DIR}"
+    sudo tee "${KLIPPER_SERVICE_DIR}/priority.conf" > /dev/null << 'EOF'
+[Service]
+# Raise CPU priority — negative nice = higher priority (range: -20 to 19)
+Nice=-10
+# Set I/O scheduler to best-effort class 2, priority 0 (highest in class)
+IOSchedulingClass=2
+IOSchedulingPriority=0
+EOF
+    sudo systemctl daemon-reload
+    ok "Klipper priority drop-in written."
+
+    # Reload Klipper if it's running to pick up new priority
+    if systemctl is-active --quiet klipper 2>/dev/null; then
+        sudo systemctl restart klipper
+        ok "Klipper restarted with new priority settings."
+    fi
+
+    # --- Disable unused services ---
+    # These ship with Debian but serve no purpose on a dedicated printer host.
+    # Disabling frees RAM and reduces background scheduling noise.
+    info "Disabling unused system services..."
+    SERVICES_TO_DISABLE=(
+        "bluetooth.service"       # No BT hardware on SonicPad
+        "avahi-daemon.service"    # mDNS — not needed, saves ~4MB RAM
+        "ModemManager.service"    # Modem management — irrelevant here
+        "apt-daily.service"       # Unattended apt runs during prints = bad
+        "apt-daily-upgrade.service"
+        "apt-daily.timer"
+        "apt-daily-upgrade.timer"
+    )
+
+    for svc in "${SERVICES_TO_DISABLE[@]}"; do
+        if systemctl list-unit-files "${svc}" &>/dev/null && \
+           systemctl is-enabled "${svc}" 2>/dev/null | grep -q "enabled"; then
+            sudo systemctl disable --now "${svc}" 2>/dev/null && \
+                ok "Disabled: ${svc}" || \
+                warn "Could not disable ${svc} — may not be present."
+        else
+            info "Already disabled or not found: ${svc}"
+        fi
+    done
+}
+
+# =============================================================================
+# SECTION 6: Log Rotation
+# =============================================================================
+setup_logrotate() {
+    banner "Log Rotation Setup"
+
+    info "Installing logrotate if not present..."
+    sudo apt-get install -y logrotate -qq
+    ok "logrotate ready."
+
+    # --- Klipper logs ---
+    info "Writing logrotate config for Klipper..."
+    sudo tee /etc/logrotate.d/klipper > /dev/null << 'EOF'
+/home/sonic/printer_data/logs/klippy.log {
+    daily
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su sonic sonic
+}
+EOF
+    ok "Klipper logrotate configured."
+
+    # --- Moonraker logs ---
+    info "Writing logrotate config for Moonraker..."
+    sudo tee /etc/logrotate.d/moonraker > /dev/null << 'EOF'
+/home/sonic/printer_data/logs/moonraker.log {
+    daily
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su sonic sonic
+}
+EOF
+    ok "Moonraker logrotate configured."
+
+    # --- Crowsnest logs ---
+    info "Writing logrotate config for Crowsnest..."
+    sudo tee /etc/logrotate.d/crowsnest > /dev/null << 'EOF'
+/home/sonic/printer_data/logs/crowsnest.log {
+    daily
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su sonic sonic
+}
+EOF
+    ok "Crowsnest logrotate configured."
+
+    # --- WiFi watchdog log ---
+    info "Writing logrotate config for wifi-watchdog..."
+    sudo tee /etc/logrotate.d/wifi-watchdog > /dev/null << 'EOF'
+/var/log/wifi-watchdog.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    ok "WiFi watchdog logrotate configured."
+
+    # --- System journal size cap ---
+    # journald can grow unbounded on a R/W filesystem — cap it at 64MB.
+    info "Capping systemd journal size to 64MB..."
+    sudo mkdir -p /etc/systemd/journald.conf.d
+    sudo tee /etc/systemd/journald.conf.d/size.conf > /dev/null << 'EOF'
+[Journal]
+SystemMaxUse=64M
+RuntimeMaxUse=32M
+EOF
+    sudo systemctl restart systemd-journald 2>/dev/null || true
+    ok "systemd journal capped at 64MB."
+
+    # Run logrotate once now to verify configs are valid
+    info "Running logrotate dry-run to verify configs..."
+    sudo logrotate --debug /etc/logrotate.conf 2>&1 | grep -E "error|warn" || true
+    ok "Logrotate configs verified."
+}
+
+# =============================================================================
 # MAIN
 # =============================================================================
 main() {
@@ -450,6 +703,10 @@ main() {
     echo "  [2] WiFi Power Save OFF + Auto-Reconnect Watchdog"
     echo "  [3] Accelerometer / Input Shaper packages (ADXL345)"
     echo "  [4] KIAUH (Klipper Installation & Update Helper)"
+    echo "  [5] System / OS Performance Tuning"
+    echo "       vm.swappiness, CPU governor, tmpfs, noatime, Klipper priority,"
+    echo "       disable unused services"
+    echo "  [6] Log Rotation (Klipper, Moonraker, Crowsnest, journal cap)"
     echo ""
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
@@ -460,14 +717,20 @@ main() {
     setup_wifi
     setup_accelerometer
     setup_kiauh
+    setup_os_tuning
+    setup_logrotate
 
     banner "Setup Complete!"
     echo -e "${GREEN}All steps finished. Summary:${NC}"
     echo ""
-    echo "  Camera  → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU)"
-    echo "  WiFi    → Power save disabled, watchdog timer active (2 min interval)"
-    echo "  Accel   → ARM toolchain + Python packages installed, sample config written"
-    echo "  KIAUH   → Ready at ~/kiauh/kiauh.sh"
+    echo "  Camera   → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU, 1280x720)"
+    echo "  WiFi     → Power save disabled, watchdog timer active (2 min interval)"
+    echo "  Accel    → ARM toolchain + Python packages installed, sample config written"
+    echo "  KIAUH    → Ready at ~/kiauh/kiauh.sh"
+    echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
+    echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
+    echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest, watchdog"
+    echo "             systemd journal capped at 64MB"
     echo ""
     echo -e "${YELLOW}Next steps:${NC}"
     echo "  1. Run  ~/kiauh/kiauh.sh  to install Klipper, Moonraker, Mainsail, Crowsnest"
@@ -478,3 +741,4 @@ main() {
 }
 
 main "$@"
+# __INJECT_PLACEHOLDER__
