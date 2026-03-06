@@ -14,7 +14,7 @@
 
 set -e
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -316,22 +316,45 @@ setup_accelerometer() {
 
     ok "ARM toolchain installed."
 
-    # Python packages for input shaper / resonance testing
-    info "Installing Python resonance/shaper dependencies..."
-    pip3 install --upgrade numpy 2>/dev/null || warn "numpy upgrade failed — may already be current."
-    pip3 install --upgrade scipy 2>/dev/null || warn "scipy upgrade failed."
+    # libopenblas is required by numpy on ARM. Without it, numpy fails to load
+    # even after pip install with: libopenblas.so.0: cannot open shared object file
+    info "Installing libopenblas (required by numpy on ARM)..."
+    sudo apt-get install -y libopenblas-dev
+    ok "libopenblas installed."
 
-    ok "Python packages installed."
-
-    # Enable SPI if needed for direct ADXL345 wiring to SonicPad GPIO
-    info "Checking SPI kernel modules..."
-    if lsmod 2>/dev/null | grep -q spi; then
-        ok "SPI module already loaded."
+    # Python packages MUST go into the klippy virtualenv.
+    # System pip3 is not used by Klipper — installing there causes
+    # "Failed to import numpy" errors at runtime.
+    # numpy 2.x fails on this platform (missing libopenblas symbols),
+    # so we pin to <2. numpy 1.26.x is the correct version here.
+    info "Installing numpy and scipy into klippy-env..."
+    KLIPPY_PIP="/home/sonic/klippy-env/bin/pip"
+    if [ -f "${KLIPPY_PIP}" ]; then
+        "${KLIPPY_PIP}" uninstall numpy -y 2>/dev/null || true
+        "${KLIPPY_PIP}" install "numpy<2" && ok "numpy<2 installed into klippy-env." || warn "numpy install failed."
+        "${KLIPPY_PIP}" install scipy && ok "scipy installed into klippy-env." || warn "scipy install failed."
+        # Verify numpy actually imports — catches libopenblas issues early
+        if /home/sonic/klippy-env/bin/python -c "import numpy" 2>/dev/null; then
+            ok "numpy import verified."
+        else
+            warn "numpy installed but import failed — libopenblas may be missing."
+            warn "Run: sudo apt-get install -y libopenblas-dev  then re-run this script."
+        fi
     else
-        warn "SPI module not detected. The SonicPad uses the R818 SoC — ADXL345 is typically"
-        warn "connected via USB (RP2040/Arduino) rather than direct SPI on this platform."
-        warn "If you are using direct SPI wiring, you may need a custom kernel."
+        warn "klippy-env not found — install Klipper via KIAUH first, then re-run this script."
+        warn "After Klipper is installed, run:"
+        warn "  sudo apt-get install -y libopenblas-dev"
+        warn "  ~/klippy-env/bin/pip install 'numpy<2' scipy"
     fi
+
+    # Confirm spidev2.0 is present
+    info "Checking SPI device..."
+    if [ -e "/dev/spidev2.0" ]; then
+        ok "/dev/spidev2.0 found."
+    else
+        warn "/dev/spidev2.0 not found — ADXL345 SPI may not work."
+    fi
+
 
     # Deploy Klipper host MCU service (needed for accelerometer on SBC)
     KLIPPER_DIR="/home/sonic/klipper"
@@ -339,79 +362,89 @@ setup_accelerometer() {
 
     if [ "${KLIPPER_FOUND}" = true ]; then
         info "Klipper found. Setting up host MCU service..."
+
+        # klipper-mcu service runs the Linux process MCU binary installed to
+        # /usr/local/bin/klipper-mcu by 'sudo make flash'.
+        # Must start BEFORE klipper.service so /tmp/klipper_host_mcu socket
+        # exists when Klipper connects to [mcu rpi].
         sudo tee "${HOST_MCU_SERVICE}" > /dev/null << 'EOF'
 [Unit]
-Description=Klipper Host MCU (for ADXL345 / resonance testing)
+Description=Klipper Linux Process MCU
 Before=klipper.service
 After=local-fs.target
 
 [Service]
 Type=simple
 User=sonic
-RemainAfterExit=yes
-ExecStart=/home/sonic/klippy-env/bin/python /home/sonic/klipper/klippy/klippy.py /home/sonic/printer_data/config/printer.cfg -l /home/sonic/printer_data/logs/klippy.log -a /tmp/klippy_uds
-ExecStartPre=/bin/sh -c "/home/sonic/klipper/scripts/flash-sd.sh /tmp/klipper_host_mcu.bin /dev/null"
+ExecStart=/usr/local/bin/klipper_mcu
 Restart=always
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable klipper-mcu.service
+        ok "klipper-mcu.service installed and enabled."
 
-        # Build the host MCU firmware
+        # Build and flash the host MCU.
+        # 'make' compiles using the existing .config (Linux process MCU).
+        # 'sudo make flash' copies the binary to /usr/local/bin/klipper-mcu.
+        # No bootloader, no serial port — just a file copy.
         info "Building Klipper host MCU firmware..."
         cd "${KLIPPER_DIR}"
-        make clean KCONFIG_CONFIG=config.host 2>/dev/null || true
-        make menuconfig KCONFIG_CONFIG=config.host 2>/dev/null || {
-            warn "make menuconfig skipped (non-interactive). Using default config."
-        }
-        make KCONFIG_CONFIG=config.host 2>/dev/null && {
+        make clean 2>/dev/null || true
+        if make 2>/dev/null; then
             ok "Host MCU firmware built."
-            sudo make flash KCONFIG_CONFIG=config.host 2>/dev/null && ok "Host MCU flashed." || warn "Flash step skipped or failed — may need manual run."
-        } || warn "Host MCU build skipped or failed. Run 'make' in ${KLIPPER_DIR} manually."
+            if sudo make flash 2>/dev/null; then
+                ok "Host MCU flashed to /usr/local/bin/klipper-mcu."
+            else
+                warn "make flash failed. Run manually: cd ~/klipper && make && sudo make flash"
+            fi
+        else
+            warn "Host MCU build failed. Run manually: cd ~/klipper && make && sudo make flash"
+        fi
         cd - > /dev/null
 
-        # Provide sample klipper config snippet
+        # Fix spidev permissions — /dev/spidev2.0 is root-only by default,
+        # which prevents the sonic user from accessing the ADXL345.
+        # udev rule makes this permanent across reboots.
+        info "Setting spidev permissions..."
+        echo 'SUBSYSTEM=="spidev", MODE="0666"' | sudo tee /etc/udev/rules.d/99-spidev.rules > /dev/null
+        sudo udevadm control --reload-rules
+        sudo chmod 666 /dev/spidev2.0 2>/dev/null || true
+        ok "spidev permissions set (persistent via udev)."
+
+        # Start the service now if Klipper is already running
+        if systemctl is-active --quiet klipper 2>/dev/null; then
+            sudo systemctl restart klipper-mcu.service 2>/dev/null &&                 ok "klipper-mcu service started." ||                 warn "klipper-mcu start failed — try: sudo systemctl start klipper-mcu"
+        fi
+
+        # Write sample config matching the proven working SonicPad macro
         info "Creating sample accelerometer config snippet..."
         cat > /home/sonic/printer_data/config/adxl345_sample.cfg << 'EOF'
 # ============================================================
-# ADXL345 Accelerometer Config Snippet
-# Add these sections to your printer.cfg
+# ADXL345 Accelerometer Config — SonicPad (Linux host MCU)
+# Merge these sections into your printer.cfg
 # ============================================================
 
-# Option A: ADXL345 via Klipper Host MCU (direct SPI wiring to SonicPad)
-[mcu host]
+[mcu rpi]
 serial: /tmp/klipper_host_mcu
 
 [adxl345]
-cs_pin: host:None
+cs_pin: rpi:None
+spi_speed: 2000000
+spi_bus: spidev2.0
 
 [resonance_tester]
 accel_chip: adxl345
+accel_per_hz: 70
 probe_points:
-    # Set to the center of your bed:
     117.5, 117.5, 10
-
-# ============================================================
-# Option B: ADXL345 via USB MCU (RP2040, Arduino, etc.)
-# Replace /dev/serial/by-id/... with your actual device path
-# ============================================================
-# [mcu adxl]
-# serial: /dev/serial/by-id/usb-Klipper_rp2040_XXXXXXXXXXXXXXXX-if00
-#
-# [adxl345]
-# cs_pin: adxl:gpio1
-# spi_bus: spi0a
-#
-# [resonance_tester]
-# accel_chip: adxl345
-# probe_points:
-#     117.5, 117.5, 10
 EOF
         ok "Sample config written to ~/printer_data/config/adxl345_sample.cfg"
     else
-        warn "Klipper directory not found at ${KLIPPER_DIR}. Install Klipper first (KIAUH will be installed next)."
-        warn "After Klipper is installed, re-run this script to complete the accelerometer setup."
+        warn "Klipper not found. Install Klipper via KIAUH first, then re-run this script."
     fi
 }
 

@@ -12,7 +12,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 |---|---|
 | 🎥 **Nebula Camera** | Installs Crowsnest if missing, writes a working `crowsnest.conf` (YUYV/CPU, 1280x720 @ 15fps), and patches `ustreamer.sh` to stop MJPEG/HW auto-detection that conflicts with the SonicPad's EHCI USB controller |
 | 📶 **WiFi Stability** | Disables XRadio power save (the #1 cause of long-print disconnections) and installs a systemd watchdog timer that auto-recovers `wlan0` every 2 minutes if connectivity drops |
-| 📈 **Accelerometer** | Installs ARM toolchain and Python packages for ADXL345 input shaper calibration, builds the Klipper host MCU firmware if Klipper is present, and drops a ready-to-use `adxl345_sample.cfg` |
+| 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, builds and flashes the Linux process MCU, creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` and `/var/log` to reduce SD card writes, `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest, and the WiFi watchdog (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
@@ -55,7 +55,7 @@ Install in this order for best results: **Klipper → Moonraker → Mainsail** (
 
 **Step 2 — Re-run the installer after Klipper is installed**
 
-The accelerometer section needs Klipper present to build the host MCU firmware. If Klipper wasn't found on the first run, do this after KIAUH finishes:
+The accelerometer section needs Klipper and the klippy virtualenv present to install numpy/scipy and build the host MCU. Re-run after KIAUH finishes:
 
 ```bash
 cd ~/sonicpad-debian-aio-installer && ./install.sh
@@ -67,7 +67,23 @@ cd ~/sonicpad-debian-aio-installer && ./install.sh
 cat ~/printer_data/config/adxl345_sample.cfg
 ```
 
-Copy the relevant section into your `printer.cfg`. Option A is for direct SPI wiring; Option B is for a USB MCU (RP2040, Arduino, etc.) which is the recommended approach for the R818.
+Merge the contents into your `printer.cfg`. The config uses the proven working settings for the SonicPad:
+
+```ini
+[mcu rpi]
+serial: /tmp/klipper_host_mcu
+
+[adxl345]
+cs_pin: rpi:None
+spi_speed: 2000000
+spi_bus: spidev2.0
+
+[resonance_tester]
+accel_chip: adxl345
+accel_per_hz: 70
+probe_points:
+    117.5, 117.5, 10
+```
 
 **Step 4 — Reboot**
 
@@ -91,11 +107,6 @@ systemctl status wifi-watchdog.timer
 /usr/sbin/iw dev wlan0 get power_save   # should say: Power save: off
 ```
 
-**WiFi watchdog log:**
-```bash
-tail -f /var/log/wifi-watchdog.log
-```
-
 **CPU governor:**
 ```bash
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor   # should say: performance
@@ -109,6 +120,17 @@ cat /proc/sys/vm/swappiness   # should say: 10
 **tmpfs mounts:**
 ```bash
 mount | grep tmpfs   # should show /tmp and /var/log
+```
+
+**klipper-mcu service:**
+```bash
+sudo systemctl status klipper-mcu
+ls -la /tmp/klipper_host_mcu   # socket must exist before Klipper starts
+```
+
+**numpy import:**
+```bash
+~/klippy-env/bin/python -c "import numpy; print(numpy.__version__)"
 ```
 
 **Accelerometer** — run in Mainsail/Fluidd console:
@@ -135,6 +157,19 @@ SAVE_CONFIG
 
 ---
 
+## Accelerometer Notes
+
+The accelerometer setup on the SonicPad has several non-obvious requirements that this script handles automatically:
+
+- **libopenblas-dev** must be installed via apt before pip — numpy on ARM requires it and will fail to import without it even after a successful pip install
+- **numpy must be pinned to `<2`** — numpy 2.x fails on this platform with missing libopenblas symbols. Version 1.26.x is the correct target
+- **numpy must be installed into `~/klippy-env/`** — system pip3 is not used by Klipper. Installing there results in "Failed to import numpy" at runtime
+- **`/dev/spidev2.0` is root-only by default** — a udev rule (`/etc/udev/rules.d/99-spidev.rules`) is installed to make it permanently accessible to the `sonic` user
+- **`klipper-mcu.service`** must be running and `/tmp/klipper_host_mcu` must exist before Klipper starts — the service is configured to start `Before=klipper.service`
+- **The host MCU binary is `klipper_mcu`** (underscore) at `/usr/local/bin/klipper_mcu` — this is where `sudo make flash` puts it in Klipper's Linux process MCU build
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -143,24 +178,30 @@ SAVE_CONFIG
 | `crowsnest.conf` not written | `~/printer_data/config` doesn't exist yet — install Moonraker via KIAUH first, then re-run the script. |
 | `ustreamer.sh` patch failed | Manually edit `~/crowsnest/libs/ustreamer.sh` around line 58 — change `-m MJPEG --encoder=HW` to `-m YUYV --encoder=CPU` |
 | WiFi still dropping | Check `dmesg \| grep "sunxi-mmc sdc1.*err"` — excessive SDIO errors may point to a hardware or power supply issue beyond software fixes. |
-| ADXL readings all zero | Verify wiring or USB MCU serial path in `printer.cfg`, then run `ACCELEROMETER_QUERY` in the console for live debug output. |
-| KIAUH won't launch | Make sure `~/kiauh/kiauh.sh` is executable: `chmod +x ~/kiauh/kiauh.sh` |
+| `mcu rpi: Unable to open port` | `klipper-mcu` service isn't running. Check: `sudo systemctl status klipper-mcu` and `ls /tmp/klipper_host_mcu` |
+| `Unable to open spi device` | spidev permissions not set. Run: `sudo chmod 666 /dev/spidev2.0` and verify udev rule exists at `/etc/udev/rules.d/99-spidev.rules` |
+| `Failed to import numpy` | numpy not in klippy-env or wrong version. Run: `sudo apt-get install -y libopenblas-dev && ~/klippy-env/bin/pip uninstall numpy -y && ~/klippy-env/bin/pip install "numpy<2"` |
+| numpy imports but SHAPER_CALIBRATE fails | scipy missing from klippy-env. Run: `~/klippy-env/bin/pip install scipy` |
 | CPU governor not persisting | Check `/etc/rc.local` exists and is executable: `ls -la /etc/rc.local` |
-| `/var/log` tmpfs not mounted | It mounts on reboot. To mount now: `sudo mount -t tmpfs -o size=32m tmpfs /var/log` |
+| `/var/log` tmpfs not mounted | Mounts on reboot. To mount now: `sudo mount -t tmpfs -o size=32m tmpfs /var/log` |
 
 ---
 
-## Notes
+## Changelog
 
-**Nebula Camera:** The Creality Nebula camera does not work with MJPEG on SonicPad-Debian due to the Allwinner vendor kernel's EHCI bandwidth scheduling limitations. YUYV at 1280x720 with CPU encoding is the proven working configuration.
+### v1.1.0
+- Accelerometer: added `libopenblas-dev` apt install (fixes numpy ARM import failure)
+- Accelerometer: pinned numpy to `<2` (numpy 2.x incompatible with this platform)
+- Accelerometer: numpy/scipy now installed into `klippy-env` virtualenv (not system pip)
+- Accelerometer: added post-install numpy import verification
+- Accelerometer: fixed `klipper-mcu` service `ExecStart` to use correct binary name `klipper_mcu` (underscore)
+- Accelerometer: added `klipper-mcu.service` enable on install
+- Accelerometer: added udev rule for permanent `spidev2.0` permissions
+- Accelerometer: updated sample config to match proven working SonicPad macro
+- General: improved spidev presence check
 
-**WiFi:** The SonicPad uses an XRadio chip over SDIO. `sunxi-mmc sdc1` errors in `dmesg` are normal and the driver recovers automatically. Disabling power save eliminates the most common source of actual print-interrupting disconnects.
-
-**tmpfs and logs:** Because `/var/log` moves to RAM, log files do not persist across reboots by default. The logrotate configs compress and retain up to 5 days of rotated logs on the SD card. If you need persistent real-time logs, remove the `/var/log` tmpfs entry from `/etc/fstab`.
-
-**Accelerometer on R818:** Most users connect the ADXL345 via a small USB MCU (RP2040 running Klipper firmware) rather than direct SPI GPIO, which is the more reliable path on this platform.
-
-**KIAUH is interactive:** The script clones it but does not run it automatically — Klipper installation requires you to choose your printer's MCU, board type, etc.
+### v1.0.0
+- Initial release
 
 ---
 
