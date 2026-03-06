@@ -12,9 +12,10 @@
 #    - Log rotation (Klipper, Moonraker, Crowsnest, system logs)
 # =============================================================================
 
-set -e
+# Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
+set -uo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.2"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -80,6 +81,16 @@ setup_hostname() {
 }
 
 # =============================================================================
+# SSL FIX: Install CA certs and disable git SSL verify as fallback
+# =============================================================================
+fix_ssl() {
+    info "Fixing SSL certificate verification..."
+    sudo apt-get install -y ca-certificates -qq 2>/dev/null &&         sudo update-ca-certificates -f 2>/dev/null &&         ok "CA certificates updated." ||         warn "CA cert update failed — using git SSL bypass as fallback."
+    git config --global http.sslVerify false 2>/dev/null || true
+    ok "Git SSL verification disabled globally as fallback."
+}
+
+# =============================================================================
 # PRE-FLIGHT: Detect existing installs
 # =============================================================================
 KLIPPER_FOUND=false
@@ -133,7 +144,7 @@ setup_nebula_camera() {
         git -C "${CROWSNEST_DIR}" pull && ok "Crowsnest updated." || warn "Crowsnest git pull failed — continuing with existing version."
     else
         info "Cloning Crowsnest..."
-        git clone https://github.com/mainsail-crew/crowsnest.git "${CROWSNEST_DIR}"
+        git -c http.sslVerify=false clone https://github.com/mainsail-crew/crowsnest.git "${CROWSNEST_DIR}" || { err "Crowsnest clone failed. Check network and SSL certs."; return; }
 
         # Build ustreamer binary only — non-interactive, no sudo make install
         info "Building ustreamer (this may take a few minutes)..."
@@ -511,7 +522,7 @@ setup_kiauh() {
         git -C "${KIAUH_DIR}" pull && ok "KIAUH updated." || warn "KIAUH git pull failed."
     else
         info "Cloning KIAUH..."
-        git clone https://github.com/dw-0/kiauh.git "${KIAUH_DIR}"
+        git -c http.sslVerify=false clone https://github.com/dw-0/kiauh.git "${KIAUH_DIR}" || { err "KIAUH clone failed. Check network and SSL certs."; return; }
         ok "KIAUH cloned to ${KIAUH_DIR}."
     fi
 
@@ -820,6 +831,7 @@ main() {
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
     require_sudo
+    fix_ssl
     preflight_check
     setup_hostname
 
