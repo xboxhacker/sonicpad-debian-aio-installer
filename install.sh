@@ -14,7 +14,7 @@
 
 set -e
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -45,6 +45,38 @@ require_sudo() {
     fi
     info "Checking sudo access..."
     sudo -v || { err "sudo access required."; exit 1; }
+}
+
+# =============================================================================
+# HOSTNAME SETUP
+# =============================================================================
+setup_hostname() {
+    banner "Hostname Configuration"
+
+    CURRENT_HOSTNAME=$(hostname)
+    info "Current hostname: ${CURRENT_HOSTNAME}"
+    echo ""
+    echo "  If you are running multiple SonicPads on the same network, each"
+    echo "  needs a unique hostname to avoid mDNS (.local) conflicts."
+    echo ""
+    echo "  Examples: SonicPad, SonicPad2, PrinterLeft, TronXY, IR3"
+    echo ""
+    read -p "  Enter new hostname [default: ${CURRENT_HOSTNAME}]: " NEW_HOSTNAME
+    NEW_HOSTNAME="${NEW_HOSTNAME:-${CURRENT_HOSTNAME}}"
+
+    # Strip whitespace
+    NEW_HOSTNAME=$(echo "${NEW_HOSTNAME}" | tr -d '[:space:]')
+
+    if [ "${NEW_HOSTNAME}" = "${CURRENT_HOSTNAME}" ]; then
+        ok "Hostname unchanged: ${CURRENT_HOSTNAME}"
+    else
+        info "Setting hostname to '${NEW_HOSTNAME}'..."
+        sudo hostnamectl set-hostname "${NEW_HOSTNAME}"
+        # Update /etc/hosts so localhost resolution still works
+        sudo sed -i "s/${CURRENT_HOSTNAME}/${NEW_HOSTNAME}/g" /etc/hosts
+        ok "Hostname set to '${NEW_HOSTNAME}'."
+        info "Pad will be reachable at ${NEW_HOSTNAME}.local after reboot."
+    fi
 }
 
 # =============================================================================
@@ -510,28 +542,21 @@ setup_os_tuning() {
     ok "vm.swappiness set to 10."
 
     # --- CPU Governor: performance ---
-    # The R818 defaults to 'ondemand' which scales clocks down during idle.
-    # This causes micro-stutters in Klipper step timing. 'performance' keeps
-    # all cores at max frequency — power draw difference is minimal on a pad.
+    # The R818 vendor kernel locks scaling_governor to root writes only and may
+    # not expose it as writable even with sudo via sysfs. We try both methods
+    # but treat failure as non-fatal — the rc.local entry below ensures it
+    # is applied at every boot when the kernel is more permissive.
     info "Setting CPU governor to 'performance'..."
-    if command -v cpufreq-set &>/dev/null; then
-        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            echo performance | sudo tee "$cpu" > /dev/null 2>&1 || true
-        done
-        ok "CPU governor set to performance via cpufreq."
+    GOVERNOR_SET=false
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [ -f "$cpu" ] || continue
+        echo performance | sudo tee "$cpu" > /dev/null 2>&1 && GOVERNOR_SET=true || true
+    done
+    if [ "$GOVERNOR_SET" = true ]; then
+        ok "CPU governor set to performance."
     else
-        # Direct sysfs write — works on the R818 vendor kernel
-        GOVERNOR_SET=false
-        for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            if [ -w "$cpu" ]; then
-                echo performance | sudo tee "$cpu" > /dev/null 2>&1 && GOVERNOR_SET=true || true
-            fi
-        done
-        if [ "$GOVERNOR_SET" = true ]; then
-            ok "CPU governor set to performance via sysfs."
-        else
-            warn "Could not set CPU governor — scaling_governor not writable. Skipping."
-        fi
+        info "scaling_governor not writable now (R818 vendor kernel limitation)."
+        info "Governor will be set to performance at next reboot via rc.local."
     fi
 
     # Make governor persistent across reboots via rc.local
@@ -556,29 +581,62 @@ EOF
         ok "CPU governor already in rc.local. Skipping."
     fi
 
-    # --- tmpfs for /tmp and /var/log ---
-    # Moves high-churn directories to RAM — keeps SD card write cycles low
-    # and reduces latency from filesystem writes during prints.
-    # /tmp: 64MB cap, /var/log: 32MB cap — plenty for the SonicPad's workload.
-    info "Configuring tmpfs for /tmp and /var/log..."
+    # --- tmpfs for /tmp only ---
+    # Moves /tmp to RAM to reduce SD card write cycles.
+    # NOTE: /var/log is intentionally NOT put on tmpfs. KlipperScreen, Xorg,
+    # and the display manager rely on persistent subdirectories under /var/log
+    # that are created at install time. A tmpfs wipes them on every boot,
+    # causing a blank screen with only the Debian logo visible.
+    info "Configuring tmpfs for /tmp..."
 
     FSTAB=/etc/fstab
-    if ! grep -q "tmpfs /tmp" "$FSTAB"; then
-        echo "tmpfs   /tmp        tmpfs   defaults,noatime,nosuid,size=64m    0 0" | sudo tee -a "$FSTAB" > /dev/null
-        ok "tmpfs /tmp added to fstab."
-    else
-        ok "tmpfs /tmp already in fstab. Skipping."
+
+    # --- fstab safety: ensure file ends with a newline ---
+    # If the last line has no trailing newline, tee -a appends directly onto
+    # the last line, corrupting the entry (e.g. "0 0tmpfs /tmp ..."). This
+    # causes the root filesystem to mount read-only on next boot.
+    if [ -f "$FSTAB" ]; then
+        if [ "$(sudo tail -c 1 "$FSTAB" | wc -l)" -eq 0 ]; then
+            printf "\n" | sudo tee -a "$FSTAB" > /dev/null
+            info "Added missing newline to end of fstab."
+        fi
     fi
 
-    if ! grep -q "tmpfs /var/log" "$FSTAB"; then
-        echo "tmpfs   /var/log    tmpfs   defaults,noatime,nosuid,size=32m    0 0" | sudo tee -a "$FSTAB" > /dev/null
-        ok "tmpfs /var/log added to fstab."
-        # Mount it now without rebooting
-        sudo mount -t tmpfs -o defaults,noatime,nosuid,size=32m tmpfs /var/log 2>/dev/null && \
-            ok "tmpfs /var/log mounted now." || \
-            warn "/var/log tmpfs will take effect on next reboot."
+    # --- fstab safety: detect and repair corrupted joined lines ---
+    if sudo grep -qP "\d 0tmpfs|\d 0PARTLABEL|\d 0/" "$FSTAB" 2>/dev/null; then
+        warn "Detected corrupted fstab entries — repairing..."
+        sudo sed -i 's/0 0tmpfs/0 0\ntmpfs/g' "$FSTAB"
+        sudo sed -i 's/0 0PARTLABEL/0 0\nPARTLABEL/g' "$FSTAB"
+        ok "fstab corruption repaired."
+    fi
+
+    # --- Remove /var/log tmpfs if added by a previous version of this script ---
+    if sudo grep -q "tmpfs.*/var/log" "$FSTAB"; then
+        sudo sed -i '/tmpfs.*\/var\/log/d' "$FSTAB"
+        warn "Removed /var/log tmpfs from fstab (was causing blank screen on boot)."
+    fi
+
+    # --- Add /tmp tmpfs with mode=1777 (required for Xorg lock files) ---
+    if ! sudo grep -q "tmpfs.*/tmp" "$FSTAB"; then
+        printf "\n" | sudo tee -a "$FSTAB" > /dev/null
+        echo "tmpfs   /tmp        tmpfs   defaults,noatime,nosuid,mode=1777,size=64m    0 0" | sudo tee -a "$FSTAB" > /dev/null
+        ok "tmpfs /tmp added to fstab."
     else
-        ok "tmpfs /var/log already in fstab. Skipping."
+        if ! sudo grep "tmpfs.*/tmp" "$FSTAB" | grep -q "mode=1777"; then
+            sudo sed -i '/tmpfs.*\/tmp/ s/nosuid/nosuid,mode=1777/' "$FSTAB"
+            ok "Added mode=1777 to existing /tmp tmpfs entry."
+        else
+            ok "tmpfs /tmp already in fstab. Skipping."
+        fi
+    fi
+
+    # --- Final fstab sanity check ---
+    info "Verifying fstab integrity..."
+    if sudo mount --fake -a 2>/dev/null; then
+        ok "fstab syntax verified OK."
+    else
+        warn "fstab may have issues — check /etc/fstab before rebooting:"
+        sudo cat "$FSTAB"
     fi
 
     # --- noatime on root filesystem ---
@@ -763,6 +821,7 @@ main() {
 
     require_sudo
     preflight_check
+    setup_hostname
 
     setup_nebula_camera
     setup_wifi
