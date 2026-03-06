@@ -66,7 +66,7 @@ preflight_check() {
     fi
 
     # --- Crowsnest ---
-    if [ -d "${CROWSNEST_DIR}" ] && [ -f "${CROWSNEST_DIR}/crowsnest.sh" ]; then
+    if [ -d "${CROWSNEST_DIR}" ] && [ -n "$(ls -A ${CROWSNEST_DIR} 2>/dev/null)" ]; then
         CROWSNEST_FOUND=true
         ok "Crowsnest detected at ${CROWSNEST_DIR}"
     else
