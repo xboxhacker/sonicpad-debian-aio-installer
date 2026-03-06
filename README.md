@@ -14,7 +14,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | 📶 **WiFi Stability** | Disables XRadio power save (the #1 cause of long-print disconnections) and installs a systemd watchdog timer that auto-recovers `wlan0` every 2 minutes if connectivity drops |
 | 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, builds and flashes the Linux process MCU, creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
-| ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` and `/var/log` to reduce SD card writes, `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
+| ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest, and the WiFi watchdog (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
 
 ---
@@ -33,13 +33,34 @@ Automates the most common post-flash configuration tasks in a single run — no 
 SSH into your SonicPad, then run:
 
 ```bash
-cd ~ && git clone https://github.com/xboxhacker/sonicpad-debian-aio-installer.git
+sudo apt-get install -y ca-certificates && sudo update-ca-certificates -f
+git -c http.sslVerify=false clone https://github.com/xboxhacker/sonicpad-debian-aio-installer.git
 cd sonicpad-debian-aio-installer
 chmod +x install.sh
 ./install.sh
 ```
 
+> **Note:** The `ca-certificates` line fixes SSL verification failures that are common on fresh SonicPad-Debian images. The script handles this automatically on subsequent runs.
+
 The script performs a pre-flight check to detect what's already installed (Klipper, Crowsnest, printer_data), then walks through each section automatically with clear status output.
+
+---
+
+## Updating the Script
+
+To pull the latest version and re-run:
+
+```bash
+cd ~/sonicpad-debian-aio-installer
+git fetch --all
+git reset --hard origin/main
+chmod +x install.sh
+./install.sh
+```
+
+The script is safe to re-run on an already-configured pad — it detects existing installs and skips steps that are already done.
+
+> **Why `git reset --hard`?** A regular `git pull` can fail if the local copy has diverged. `reset --hard` forces the local copy to exactly match the remote, which is always what you want here.
 
 ---
 
@@ -188,6 +209,25 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.2.2
+- Fixed: script would silently exit on any failed command due to `set -e` — replaced with explicit per-command error handling
+- Fixed: `fix_ssl()` now runs before preflight and all git operations, preventing SSL failures on fresh images
+- Fixed: fstab corruption where tmpfs line was appended directly onto rootfs line with no newline, causing root filesystem to mount read-only on next boot
+- Fixed: removed `/var/log` tmpfs — was wiping Xorg/KlipperScreen log directories on boot, causing blank screen
+- Fixed: `/tmp` tmpfs now uses `mode=1777` so Xorg lock files work correctly
+- Fixed: fstab auto-repair detects and fixes corrupted joined lines from previous script versions
+- Added: `mount --fake -a` fstab validation before reboot
+- Added: git clone now uses `-c http.sslVerify=false` as fallback on all clone operations
+- Added: hostname configuration step with conflict warning for multi-pad networks
+
+### v1.2.1 *(superseded by v1.2.2)*
+- Added SSL certificate fix (`ca-certificates` install + `update-ca-certificates`) at script start
+- Added `git config --global http.sslVerify false` as session-wide fallback
+
+### v1.2.0 *(superseded by v1.2.2)*
+- fstab safety improvements (partial — had newline issue)
+- Removed `/var/log` tmpfs
 
 ### v1.1.0
 - Accelerometer: added `libopenblas-dev` apt install (fixes numpy ARM import failure)
