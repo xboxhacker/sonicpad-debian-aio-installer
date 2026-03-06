@@ -92,21 +92,39 @@ setup_nebula_camera() {
     banner "Nebula Camera Setup"
 
     # --- Install or update Crowsnest ---
+    # We clone and build crowsnest manually rather than using 'make install'
+    # because crowsnest's installer is interactive (prompts for user input)
+    # and will hang a non-interactive script.
+    # KIAUH handles the full crowsnest service install interactively if needed.
     if [ "${CROWSNEST_FOUND}" = true ]; then
         info "Crowsnest already installed. Pulling latest..."
         git -C "${CROWSNEST_DIR}" pull && ok "Crowsnest updated." || warn "Crowsnest git pull failed — continuing with existing version."
     else
-        info "Installing Crowsnest..."
+        info "Cloning Crowsnest..."
         git clone https://github.com/mainsail-crew/crowsnest.git "${CROWSNEST_DIR}"
+
+        # Build ustreamer binary only — non-interactive, no sudo make install
+        info "Building ustreamer (this may take a few minutes)..."
         cd "${CROWSNEST_DIR}"
-        sudo make install 2>/dev/null || {
-            warn "make install failed — attempting manual service install..."
-            sudo cp "${CROWSNEST_DIR}/crowsnest.service" "${SYSTEMD_DIR}/crowsnest.service" 2>/dev/null || true
-            sudo systemctl daemon-reload
+        make build 2>/dev/null && ok "ustreamer built." || {
+            warn "make build failed — trying bin/ustreamer directly..."
+            make -C bin/ustreamer 2>/dev/null && ok "ustreamer built (fallback)." ||                 warn "ustreamer build failed. Try running: cd ~/crowsnest && make build"
         }
-        sudo systemctl enable crowsnest 2>/dev/null || true
         cd - > /dev/null
-        ok "Crowsnest installed."
+
+        # Install crowsnest as a service non-interactively
+        # crowsnest ships a pre-built .service file we can copy directly
+        if [ -f "${CROWSNEST_DIR}/crowsnest.service" ]; then
+            sudo cp "${CROWSNEST_DIR}/crowsnest.service" "${SYSTEMD_DIR}/crowsnest.service"
+            sudo systemctl daemon-reload
+            sudo systemctl enable crowsnest 2>/dev/null || true
+            ok "crowsnest.service installed and enabled."
+        else
+            warn "crowsnest.service file not found — skipping service install."
+            warn "Use KIAUH to install Crowsnest as a service after this script."
+        fi
+
+        ok "Crowsnest cloned and built."
     fi
 
     # --- crowsnest.conf ---
