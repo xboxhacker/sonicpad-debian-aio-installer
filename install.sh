@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -240,6 +240,32 @@ EOF
 setup_wifi() {
     banner "WiFi Stability Setup"
 
+    # --- Force station mode at boot ---
+    # The XRadio chip (wlan0) on the SonicPad sometimes initializes in P2P mode
+    # instead of managed/station mode. When this happens the interface appears
+    # connected but has no network access and can take forever to switch over,
+    # or never does. Forcing station mode before wpa_supplicant starts fixes this.
+    info "Installing xradio-station-mode.service (fixes P2P boot issue)..."
+    sudo tee "${SYSTEMD_DIR}/xradio-station-mode.service" > /dev/null << 'EOF'
+[Unit]
+Description=Force XRadio wlan0 into station mode before wpa_supplicant
+Before=wpa_supplicant.service network.target
+After=sys-subsystem-net-devices-wlan0.device
+Wants=sys-subsystem-net-devices-wlan0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c "ip link set wlan0 down && iw dev wlan0 set type station && ip link set wlan0 up"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable xradio-station-mode.service
+    sudo systemctl start xradio-station-mode.service 2>/dev/null || true
+    ok "xradio-station-mode.service enabled."
+
     # --- Disable power save immediately ---
     info "Disabling WiFi power save..."
     if /usr/sbin/iw dev wlan0 get power_save 2>/dev/null | grep -q "off"; then
@@ -253,8 +279,8 @@ setup_wifi() {
     sudo tee "${SYSTEMD_DIR}/wifi-powersave-off.service" > /dev/null << 'EOF'
 [Unit]
 Description=Disable WiFi Power Save on wlan0
-After=network-online.target
-Wants=network-online.target
+After=xradio-station-mode.service
+Wants=xradio-station-mode.service
 
 [Service]
 Type=oneshot
@@ -300,9 +326,10 @@ if ! ping -I "$INTERFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$TEST_HOST" > /de
     # Ensure power save is still off
     /usr/sbin/iw dev "$INTERFACE" set power_save off 2>/dev/null
 
-    # Bring the interface down and back up
+    # Bring the interface down, force station mode, back up
     ip link set "$INTERFACE" down
     sleep 2
+    iw dev "$INTERFACE" set type station 2>/dev/null || true
     ip link set "$INTERFACE" up
     sleep 5
 
