@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.2.3"
+SCRIPT_VERSION="1.2.4"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -133,6 +133,17 @@ preflight_check() {
 # =============================================================================
 setup_nebula_camera() {
     banner "Nebula Camera Setup"
+
+    # Ensure sonic user is in the video group — required to access /dev/video0.
+    # Without this crowsnest fails with "No usable Devices Found" even though
+    # the camera is physically present and detected by the kernel.
+    info "Adding sonic user to video group..."
+    if groups sonic | grep -q "video"; then
+        ok "sonic already in video group."
+    else
+        sudo usermod -a -G video sonic
+        ok "sonic added to video group (takes effect on next login/reboot)."
+    fi
 
     # --- Install or update Crowsnest ---
     # We clone and build crowsnest manually rather than using 'make install'
@@ -842,7 +853,7 @@ main() {
     clear
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       SonicPad Debian All-In-One Setup v${SCRIPT_VERSION}         ║${NC}"
+    echo -e "${CYAN}║       SonicPad Debian All-In-One Setup v${SCRIPT_VERSION}           ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo "  This script will configure:"
