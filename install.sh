@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.2.9"
+SCRIPT_VERSION="1.3.1"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -273,17 +273,57 @@ Wants=sys-subsystem-net-devices-wlan0.device
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c "ip link set wlan0 down && iw dev wlan0 set type station && ip link set wlan0 up"
+ExecStart=/usr/local/bin/xradio-station-mode.sh
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # Write the station mode script — detects correct module name at runtime
+    sudo tee /usr/local/bin/xradio-station-mode.sh > /dev/null << 'STATIONMODE'
+#!/bin/bash
+# Force XRadio WiFi chip into station (managed) mode
+# Handles both xr819_wlan and xradio_wlan module names
+
+IFACE="wlan0"
+
+# Detect which module name is in use
+if lsmod | grep -q "xr819_wlan"; then
+    MOD="xr819_wlan"
+elif lsmod | grep -q "xradio_wlan"; then
+    MOD="xradio_wlan"
+else
+    MOD="xradio"
+fi
+
+# Bring interface down, reload module, force station mode, bring back up
+ip link set "$IFACE" down 2>/dev/null || true
+rmmod "$MOD" 2>/dev/null || true
+sleep 2
+modprobe "$MOD" 2>/dev/null || true
+sleep 3
+ip link set "$IFACE" down 2>/dev/null || true
+iw dev "$IFACE" set type station 2>/dev/null || true
+ip link set "$IFACE" up 2>/dev/null || true
+iw dev "$IFACE" set power_save off 2>/dev/null || true
+STATIONMODE
+    sudo chmod +x /usr/local/bin/xradio-station-mode.sh
     sudo systemctl daemon-reload
     sudo systemctl enable xradio-station-mode.service
     sudo systemctl start xradio-station-mode.service 2>/dev/null || true
     ok "xradio-station-mode.service enabled."
 
     # --- Disable power save immediately ---
+    # Tell NetworkManager to ignore p2p0 — prevents it from grabbing p2p0
+    # at boot instead of wlan0 (root cause of "boots to P2P" issue)
+    info "Configuring NetworkManager to ignore p2p0 interface..."
+    sudo mkdir -p /etc/NetworkManager/conf.d
+    sudo tee /etc/NetworkManager/conf.d/99-ignore-p2p.conf > /dev/null << 'NMCONF'
+[keyfile]
+unmanaged-devices=interface-name:p2p0
+NMCONF
+    ok "NetworkManager will ignore p2p0 at boot."
+
     info "Disabling WiFi power save..."
     if /usr/sbin/iw dev wlan0 get power_save 2>/dev/null | grep -q "off"; then
         ok "WiFi power save already off."
@@ -353,12 +393,13 @@ force_station_mode() {
 reload_xradio_module() {
     # Nuclear option — unload and reload the XRadio kernel module.
     # This fully resets the chip out of P2P mode when soft methods fail.
+    # Module name varies by SonicPad kernel: xr819_wlan or xradio_wlan
     log "INFO: Reloading xradio kernel module to force reset..."
     systemctl stop wpa_supplicant 2>/dev/null || true
     ip link set "$INTERFACE" down 2>/dev/null || true
-    rmmod xradio_wlan 2>/dev/null || rmmod xradio 2>/dev/null || true
+    rmmod xr819_wlan 2>/dev/null || rmmod xradio_wlan 2>/dev/null || rmmod xradio 2>/dev/null || true
     sleep 3
-    modprobe xradio_wlan 2>/dev/null || modprobe xradio 2>/dev/null || true
+    modprobe xr819_wlan 2>/dev/null || modprobe xradio_wlan 2>/dev/null || modprobe xradio 2>/dev/null || true
     sleep 5
     force_station_mode
     sleep 2
