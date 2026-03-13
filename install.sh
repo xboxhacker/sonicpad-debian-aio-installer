@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -324,17 +324,37 @@ unmanaged-devices=interface-name:p2p0
 NMCONF
     ok "NetworkManager will ignore p2p0 at boot."
 
-    # Disable MAC address randomization — random MACs cause DHCP conflicts
-    # when multiple pads are on the same network (both get same IP)
-    info "Disabling WiFi MAC address randomization..."
-    sudo tee /etc/NetworkManager/conf.d/99-no-mac-randomize.conf > /dev/null << 'NMRAND'
+    # Unique MAC per device — SonicPads often ship with identical hardware MACs.
+    # When multiple pads share the same MAC, DHCP assigns the same IP to all.
+    # We derive a unique, stable MAC from /etc/machine-id (unique per device)
+    # so each pad gets its own IP on any network. Uses locally-administered
+    # prefix 02: so it's valid and won't conflict with real hardware.
+    info "Configuring unique WiFi MAC per device (fixes multi-pad IP conflicts)..."
+    MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
+    HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
+    if [ -n "${HASH}" ]; then
+        CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
+        sudo tee /etc/NetworkManager/conf.d/99-unique-mac-per-device.conf > /dev/null << NMRAND
+[device]
+wifi.scan-rand-mac-address=no
+
+[connection]
+wifi.cloned-mac-address=${CLONED_MAC}
+NMRAND
+        ok "Unique MAC ${CLONED_MAC} configured (derived from machine-id)."
+    else
+        warn "Could not generate unique MAC — falling back to permanent hardware MAC."
+        sudo tee /etc/NetworkManager/conf.d/99-unique-mac-per-device.conf > /dev/null << 'NMRAND'
 [device]
 wifi.scan-rand-mac-address=no
 
 [connection]
 wifi.cloned-mac-address=permanent
 NMRAND
-    ok "MAC randomization disabled — permanent hardware MAC will be used."
+    fi
+
+    # Remove legacy config if present (script used to write 99-no-mac-randomize.conf)
+    sudo rm -f /etc/NetworkManager/conf.d/99-no-mac-randomize.conf 2>/dev/null || true
 
     info "Disabling WiFi power save..."
     if /usr/sbin/iw dev wlan0 get power_save 2>/dev/null | grep -q "off"; then
@@ -990,7 +1010,8 @@ main() {
     echo -e "${GREEN}All steps finished. Summary:${NC}"
     echo ""
     echo "  Camera   → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU, 1280x720)"
-    echo "  WiFi     → Power save disabled, watchdog timer active (2 min interval)"
+    echo "  WiFi     → Unique MAC per device (fixes multi-pad IP conflicts), power save"
+    echo "             disabled, watchdog timer active (2 min interval)"
     echo "  Accel    → ARM toolchain + Python packages installed, sample config written"
     echo "  KIAUH    → Ready at ~/kiauh/kiauh.sh"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
@@ -999,11 +1020,13 @@ main() {
     echo "             systemd journal capped at 64MB"
     echo ""
     echo -e "${YELLOW}Next steps:${NC}"
-    echo "  1. Launch KIAUH to install Klipper, Moonraker, Mainsail, Crowsnest"
+    echo "  1. If you have multiple SonicPads: run this script on EACH pad (each gets a"
+    echo "     unique MAC from its machine-id, so they'll receive different IPs)."
+    echo "  2. Launch KIAUH to install Klipper, Moonraker, Mainsail, Crowsnest"
     echo "     (use the option below to launch with TMPDIR fix for OctoEverywhere)"
-    echo "  2. After Klipper is installed, re-run this script to complete host MCU setup"
-    echo "  3. Review ~/printer_data/config/adxl345_sample.cfg and merge into printer.cfg"
-    echo "  4. Reboot:  sudo reboot"
+    echo "  3. After Klipper is installed, re-run this script to complete host MCU setup"
+    echo "  4. Review ~/printer_data/config/adxl345_sample.cfg and merge into printer.cfg"
+    echo "  5. Reboot:  sudo reboot (required for unique MAC to take effect)"
     echo ""
     echo -e "${YELLOW}TIP:${NC} When installing OctoEverywhere via KIAUH Extensions,"
     echo "     launch KIAUH with TMPDIR set to avoid 'No space left on device' errors."

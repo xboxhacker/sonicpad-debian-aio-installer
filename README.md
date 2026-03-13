@@ -11,7 +11,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | | What Gets Done |
 |---|---|
 | 🎥 **Nebula Camera** | Installs Crowsnest if missing, writes a working `crowsnest.conf` (YUYV/CPU, 1280x720 @ 15fps), and patches `ustreamer.sh` to stop MJPEG/HW auto-detection that conflicts with the SonicPad's EHCI USB controller |
-| 📶 **WiFi Stability** | Disables XRadio power save (the #1 cause of long-print disconnections) and installs a systemd watchdog timer that auto-recovers `wlan0` every 2 minutes if connectivity drops |
+| 📶 **WiFi Stability** | Assigns a unique MAC per device (fixes multi-pad IP conflicts when SonicPads share the same hardware MAC), disables XRadio power save (the #1 cause of long-print disconnections), and installs a systemd watchdog timer that auto-recovers `wlan0` every 2 minutes if connectivity drops |
 | 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, builds and flashes the Linux process MCU, creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
@@ -209,6 +209,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.3.3
+- Fixed: multi-pad IP conflict — SonicPads often ship with identical hardware MACs, causing DHCP to assign the same IP to all. Script now derives a unique, stable MAC from `/etc/machine-id` per device so each pad gets its own IP on any network. Run the script on each pad; reboot to apply.
 
 ### v1.2.2
 - Fixed: script would silently exit on any failed command due to `set -e` — replaced with explicit per-command error handling
