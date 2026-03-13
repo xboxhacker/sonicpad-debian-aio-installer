@@ -118,14 +118,29 @@ fix_ssl() {
 # STOP KLIPPER SERVICES — prevents file locks, MCU conflicts during install
 # =============================================================================
 stop_klipper_services() {
-    info "Stopping Klipper services (klipper, moonraker, crowsnest, klipper-mcu)..."
-    for svc in klipper moonraker crowsnest klipper-mcu; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            sudo systemctl stop "$svc" 2>/dev/null && ok "Stopped: $svc" || warn "Could not stop $svc"
-        else
-            info "Already stopped: $svc"
+    banner "Stopping Klipper Services"
+    # Stop in dependency order: KlipperScreen, Crowsnest, Moonraker, Klipper, klipper-mcu
+    # Use sudo throughout — user may lack permission to query/control system services.
+    # Call stop unconditionally (ignore is-active) — catches services in weird states.
+    STOPPED_ANY=false
+    for svc in KlipperScreen crowsnest moonraker klipper klipper-mcu; do
+        if sudo systemctl stop "$svc" 2>/dev/null; then
+            ok "Stopped: $svc"
+            STOPPED_ANY=true
+        elif sudo systemctl is-active --quiet "$svc" 2>/dev/null; then
+            warn "Could not stop $svc"
         fi
     done
+    # Stop any instance variants (klipper-1, moonraker-2, etc.)
+    RUNNING=$(sudo systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^klipper-|^moonraker-|^crowsnest-|^KlipperScreen-' || true)
+    if [ -n "$RUNNING" ]; then
+        for unit in $RUNNING; do
+            svc="${unit%.service}"
+            sudo systemctl stop "$svc" 2>/dev/null && ok "Stopped: $svc" || warn "Could not stop $svc"
+            STOPPED_ANY=true
+        done
+    fi
+    [ "$STOPPED_ANY" = false ] && info "No Klipper services were running."
 }
 
 # =============================================================================
