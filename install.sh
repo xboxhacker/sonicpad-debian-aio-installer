@@ -379,6 +379,43 @@ NMRAND
     # Remove legacy config if present (script used to write 99-no-mac-randomize.conf)
     sudo rm -f /etc/NetworkManager/conf.d/99-no-mac-randomize.conf 2>/dev/null || true
 
+    # Late MAC fix — xradio-station-mode sets MAC at boot, but another service (e.g. NM or
+    # wpa_supplicant) may bring up wlan0 afterward and reset it. This service runs ~10s
+    # after network.target and reapplies the unique MAC, ensuring it sticks.
+    info "Installing set-unique-mac.service (ensures unique MAC persists at boot)..."
+    sudo tee /usr/local/bin/set-unique-mac.sh > /dev/null << 'SETMAC'
+#!/bin/bash
+IFACE="wlan0"
+[ ! -e "/sys/class/net/${IFACE}" ] && exit 0
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
+HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
+[ -z "${HASH}" ] && exit 0
+CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
+CURRENT=$(cat /sys/class/net/${IFACE}/address 2>/dev/null)
+[ "$CURRENT" = "$CLONED_MAC" ] && exit 0
+ip link set "$IFACE" down 2>/dev/null || true
+ip link set "$IFACE" address "$CLONED_MAC" 2>/dev/null || true
+ip link set "$IFACE" up 2>/dev/null || true
+SETMAC
+    sudo chmod +x /usr/local/bin/set-unique-mac.sh
+    sudo tee "${SYSTEMD_DIR}/set-unique-mac.service" > /dev/null << 'EOF'
+[Unit]
+Description=Apply unique MAC to wlan0 (multi-pad IP fix)
+After=network.target wpa_supplicant.service NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/set-unique-mac.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable set-unique-mac.service
+    ok "set-unique-mac.service enabled (runs 10s after boot)."
+
     info "Disabling WiFi power save..."
     if /usr/sbin/iw dev wlan0 get power_save 2>/dev/null | grep -q "off"; then
         ok "WiFi power save already off."
