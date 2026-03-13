@@ -115,6 +115,20 @@ fix_ssl() {
 }
 
 # =============================================================================
+# STOP KLIPPER SERVICES — prevents file locks, MCU conflicts during install
+# =============================================================================
+stop_klipper_services() {
+    info "Stopping Klipper services (klipper, moonraker, crowsnest, klipper-mcu)..."
+    for svc in klipper moonraker crowsnest klipper-mcu; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            sudo systemctl stop "$svc" 2>/dev/null && ok "Stopped: $svc" || warn "Could not stop $svc"
+        else
+            info "Already stopped: $svc"
+        fi
+    done
+}
+
+# =============================================================================
 # PRE-FLIGHT: Detect existing installs
 # =============================================================================
 KLIPPER_FOUND=false
@@ -1267,6 +1281,7 @@ main() {
 
     require_sudo
     fix_ssl
+    stop_klipper_services
     preflight_check
     setup_hostname
 
