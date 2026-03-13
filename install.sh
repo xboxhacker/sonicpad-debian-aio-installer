@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -323,6 +323,18 @@ STATIONMODE
 unmanaged-devices=interface-name:p2p0
 NMCONF
     ok "NetworkManager will ignore p2p0 at boot."
+
+    # Disable MAC address randomization — random MACs cause DHCP conflicts
+    # when multiple pads are on the same network (both get same IP)
+    info "Disabling WiFi MAC address randomization..."
+    sudo tee /etc/NetworkManager/conf.d/99-no-mac-randomize.conf > /dev/null << 'NMRAND'
+[device]
+wifi.scan-rand-mac-address=no
+
+[connection]
+wifi.cloned-mac-address=permanent
+NMRAND
+    ok "MAC randomization disabled — permanent hardware MAC will be used."
 
     info "Disabling WiFi power save..."
     if /usr/sbin/iw dev wlan0 get power_save 2>/dev/null | grep -q "off"; then
