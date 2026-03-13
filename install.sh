@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.2.4"
+SCRIPT_VERSION="1.2.5"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -312,6 +312,7 @@ EOF
 #!/bin/bash
 # WiFi Watchdog for SonicPad (XRadio SDIO chip)
 # Detects loss of network connectivity and recovers wlan0
+# Uses escalating recovery: soft bounce -> station mode force -> module reload
 
 INTERFACE="wlan0"
 TEST_HOST="8.8.8.8"
@@ -319,6 +320,7 @@ PING_COUNT=3
 PING_TIMEOUT=5
 LOG="/var/log/wifi-watchdog.log"
 MAX_LOG_LINES=500
+FAIL_COUNT_FILE="/tmp/wifi-watchdog-fails"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
@@ -330,37 +332,75 @@ trim_log() {
     fi
 }
 
-# Check connectivity
-if ! ping -I "$INTERFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$TEST_HOST" > /dev/null 2>&1; then
-    log "WARN: No connectivity detected on $INTERFACE. Attempting recovery..."
+check_ping() {
+    ping -I "$INTERFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$TEST_HOST" > /dev/null 2>&1
+}
 
-    # Ensure power save is still off
-    /usr/sbin/iw dev "$INTERFACE" set power_save off 2>/dev/null
-
-    # Bring the interface down, force station mode, back up
-    ip link set "$INTERFACE" down
-    sleep 2
+force_station_mode() {
+    ip link set "$INTERFACE" down 2>/dev/null
+    sleep 1
     iw dev "$INTERFACE" set type station 2>/dev/null || true
-    ip link set "$INTERFACE" up
+    ip link set "$INTERFACE" up 2>/dev/null
+    /usr/sbin/iw dev "$INTERFACE" set power_save off 2>/dev/null || true
+}
+
+reload_xradio_module() {
+    # Nuclear option — unload and reload the XRadio kernel module.
+    # This fully resets the chip out of P2P mode when soft methods fail.
+    log "INFO: Reloading xradio kernel module to force reset..."
+    systemctl stop wpa_supplicant 2>/dev/null || true
+    ip link set "$INTERFACE" down 2>/dev/null || true
+    rmmod xradio_wlan 2>/dev/null || rmmod xradio 2>/dev/null || true
+    sleep 3
+    modprobe xradio_wlan 2>/dev/null || modprobe xradio 2>/dev/null || true
     sleep 5
-
-    # Restart wpa_supplicant if used
-    if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
-        systemctl restart wpa_supplicant
-        sleep 5
-    fi
-
-    # Try DHCP renewal
+    force_station_mode
+    sleep 2
+    systemctl start wpa_supplicant 2>/dev/null || true
+    sleep 8
     dhclient "$INTERFACE" -1 2>/dev/null || true
+}
+
+# Read consecutive fail count
+FAILS=0
+if [ -f "$FAIL_COUNT_FILE" ]; then
+    FAILS=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
+fi
+
+if ! check_ping; then
+    FAILS=$((FAILS + 1))
+    echo "$FAILS" > "$FAIL_COUNT_FILE"
+    log "WARN: No connectivity on $INTERFACE (consecutive fails: $FAILS). Attempting recovery..."
+
+    if [ "$FAILS" -le 3 ]; then
+        # Soft recovery: force station mode and restart wpa_supplicant
+        force_station_mode
+        sleep 5
+        if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
+            systemctl restart wpa_supplicant
+            sleep 8
+        fi
+        dhclient "$INTERFACE" -1 2>/dev/null || true
+
+    else
+        # Hard recovery: reload the XRadio module entirely
+        log "WARN: Soft recovery failed $FAILS times — escalating to module reload."
+        reload_xradio_module
+    fi
 
     # Final check
-    if ping -I "$INTERFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$TEST_HOST" > /dev/null 2>&1; then
-        log "OK: WiFi recovered successfully."
+    if check_ping; then
+        log "OK: WiFi recovered successfully (after $FAILS attempts)."
+        echo "0" > "$FAIL_COUNT_FILE"
     else
-        log "ERROR: WiFi recovery failed. Manual intervention may be needed."
+        log "ERROR: WiFi recovery failed (attempt $FAILS)."
     fi
 else
-    : # Connectivity OK — no log spam
+    # Connectivity OK — reset fail counter
+    if [ "$FAILS" -gt 0 ]; then
+        log "OK: Connectivity restored. Resetting fail counter."
+        echo "0" > "$FAIL_COUNT_FILE"
+    fi
 fi
 
 trim_log
@@ -853,7 +893,7 @@ main() {
     clear
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       SonicPad Debian All-In-One Setup v${SCRIPT_VERSION}           ║${NC}"
+    echo -e "${CYAN}║       SonicPad Debian All-In-One Setup v${SCRIPT_VERSION}         ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo "  This script will configure:"
