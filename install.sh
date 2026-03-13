@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.2.5"
+SCRIPT_VERSION="1.2.7"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -73,8 +73,14 @@ setup_hostname() {
     else
         info "Setting hostname to '${NEW_HOSTNAME}'..."
         sudo hostnamectl set-hostname "${NEW_HOSTNAME}"
-        # Update /etc/hosts so localhost resolution still works
+        # Update /etc/hosts — replace old hostname and ensure 127.0.1.1 entry exists
         sudo sed -i "s/${CURRENT_HOSTNAME}/${NEW_HOSTNAME}/g" /etc/hosts
+        # Ensure 127.0.1.1 maps to new hostname (prevents "sudo: unable to resolve host" warnings)
+        if grep -q "^127.0.1.1" /etc/hosts; then
+            sudo sed -i "s/^127.0.1.1.*/127.0.1.1 ${NEW_HOSTNAME}/" /etc/hosts
+        else
+            echo "127.0.1.1 ${NEW_HOSTNAME}" | sudo tee -a /etc/hosts > /dev/null
+        fi
         ok "Hostname set to '${NEW_HOSTNAME}'."
         info "Pad will be reachable at ${NEW_HOSTNAME}.local after reboot."
     fi
@@ -479,6 +485,13 @@ setup_accelerometer() {
             warn "numpy installed but import failed — libopenblas may be missing."
             warn "Run: sudo apt-get install -y libopenblas-dev  then re-run this script."
         fi
+
+        # Clean up pip build cache and apt cache — numpy/scipy leave large
+        # build artifacts that can fill the SD card (seen: Errno 28 No space left)
+        info "Cleaning up build cache to free SD card space..."
+        "${KLIPPY_PIP}" cache purge 2>/dev/null || true
+        sudo apt-get clean 2>/dev/null || true
+        ok "Build cache cleared."
     else
         warn "klippy-env not found — install Klipper via KIAUH first, then re-run this script."
         warn "After Klipper is installed, run:"
