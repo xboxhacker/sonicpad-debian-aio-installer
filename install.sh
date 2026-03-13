@@ -15,10 +15,23 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.5"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
+SKIP_WIFI=false
+
+# Parse flags: --skip-wifi or --safe-mode skips all WiFi/MAC changes (use after fresh flash)
+for arg in "$@"; do
+    case "$arg" in
+        --skip-wifi|--safe-mode) SKIP_WIFI=true ;;
+        -h|--help)
+            echo "Usage: $0 [--skip-wifi|--safe-mode]"
+            echo "  --skip-wifi, --safe-mode  Skip WiFi setup and MAC changes (recommended for fresh flash)"
+            exit 0
+            ;;
+    esac
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -265,6 +278,10 @@ EOF
 # SECTION 2: WiFi Watchdog
 # =============================================================================
 setup_wifi() {
+    if [ "$SKIP_WIFI" = true ]; then
+        warn "Skipping WiFi setup (--skip-wifi or --safe-mode). Run without flag to enable."
+        return 0
+    fi
     banner "WiFi Stability Setup"
 
     # --- Force station mode at boot ---
@@ -339,6 +356,34 @@ STATIONMODE
     sudo systemctl start xradio-station-mode.service 2>/dev/null || true
     ok "xradio-station-mode.service enabled."
 
+    # Delayed MAC fix — run xradio-station-mode 60s after boot via timer. Other
+    # services may bring up wlan0 with hardware MAC first. Timer is more reliable
+    # than a service with sleep for delayed boot execution.
+    info "Installing fix-mac-at-boot (timer, runs 60s after boot)..."
+    sudo tee "${SYSTEMD_DIR}/fix-mac-at-boot.service" > /dev/null << 'EOF'
+[Unit]
+Description=Fix unique MAC on wlan0 (multi-pad IP)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xradio-station-mode.sh
+EOF
+    sudo tee "${SYSTEMD_DIR}/fix-mac-at-boot.timer" > /dev/null << 'EOF'
+[Unit]
+Description=Run fix-mac-at-boot 60s after boot
+
+[Timer]
+OnBootSec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable fix-mac-at-boot.timer
+    sudo systemctl start fix-mac-at-boot.timer 2>/dev/null || true
+    ok "fix-mac-at-boot.timer enabled (runs 60s after boot)."
+
     # --- Disable power save immediately ---
     # Tell NetworkManager to ignore p2p0 — prevents it from grabbing p2p0
     # at boot instead of wlan0 (root cause of "boots to P2P" issue)
@@ -355,11 +400,49 @@ NMCONF
     # We derive a unique, stable MAC from /etc/machine-id (unique per device)
     # so each pad gets its own IP on any network. Uses locally-administered
     # prefix 02: so it's valid and won't conflict with real hardware.
+    #
+    # PREFERRED: U-Boot wifi_mac — SonicPad firmware (env.cfg) passes wifi_mac to kernel
+    # via boot args. If fw_setenv works, the MAC is set at boot before any userspace.
+    # FALLBACK: userspace (udev, xradio-station-mode, cron, timer) if U-Boot env fails.
     info "Configuring unique WiFi MAC per device (fixes multi-pad IP conflicts)..."
     MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
     HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
+    CLONED_MAC=""
     if [ -n "${HASH}" ]; then
         CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
+    fi
+
+    # --- Try U-Boot fw_setenv first (kernel gets wifi_mac at boot) ---
+    UBOOT_MAC_OK=false
+    if [ -n "${CLONED_MAC}" ] && [ -b /dev/mmcblk0 ]; then
+        info "Attempting U-Boot wifi_mac (persists in boot env, applied at kernel boot)..."
+        if ! dpkg -l u-boot-tools &>/dev/null; then
+            sudo apt-get update -qq 2>/dev/null
+            sudo apt-get install -y u-boot-tools -qq 2>/dev/null || true
+        fi
+        if command -v fw_printenv &>/dev/null; then
+            # SonicPad sys_config: env at block 9216 (512 bytes), size 1024 blocks
+            # Byte offset: 9216*512 = 4718592 = 0x480000. Env size typically 0x20000.
+            if [ ! -f /etc/fw_env.config ]; then
+                echo "/dev/mmcblk0 0x480000 0x20000" | sudo tee /etc/fw_env.config > /dev/null
+            fi
+            if [ -f /etc/fw_env.config ]; then
+                FW_ERR=$(sudo fw_printenv 2>&1)
+                if ! echo "$FW_ERR" | grep -qi "bad crc\|cannot read\|error"; then
+                    if sudo fw_setenv wifi_mac "${CLONED_MAC}" 2>/dev/null; then
+                        UBOOT_MAC_OK=true
+                        ok "U-Boot wifi_mac set to ${CLONED_MAC} (will apply at next reboot)."
+                    fi
+                fi
+            fi
+        fi
+        if [ "$UBOOT_MAC_OK" = false ]; then
+            warn "U-Boot wifi_mac not available (fw_setenv failed or wrong offset). Using userspace fallback."
+        fi
+    fi
+
+    # --- Userspace MAC config (NetworkManager, udev, services) — used if U-Boot failed or as backup ---
+    if [ -n "${CLONED_MAC}" ]; then
         sudo tee /etc/NetworkManager/conf.d/99-unique-mac-per-device.conf > /dev/null << NMRAND
 [device]
 wifi.scan-rand-mac-address=no
@@ -381,6 +464,24 @@ NMRAND
 
     # Remove legacy config if present (script used to write 99-no-mac-randomize.conf)
     sudo rm -f /etc/NetworkManager/conf.d/99-no-mac-randomize.conf 2>/dev/null || true
+
+    # udev rule — set unique MAC the instant wlan0 appears (before wpa_supplicant etc.)
+    # This catches the interface at creation time, when the driver first loads.
+    info "Installing udev rule for unique MAC on wlan0..."
+    sudo tee /usr/local/bin/set-unique-mac-udev.sh > /dev/null << 'SETMACUDEV'
+#!/bin/bash
+IFACE="${1:-wlan0}"
+[ ! -e "/sys/class/net/${IFACE}" ] && exit 0
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
+HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
+[ -z "${HASH}" ] && exit 0
+CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
+ip link set "$IFACE" address "$CLONED_MAC" 2>/dev/null || true
+SETMACUDEV
+    sudo chmod +x /usr/local/bin/set-unique-mac-udev.sh
+    echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/usr/local/bin/set-unique-mac-udev.sh %k"' | sudo tee /etc/udev/rules.d/99-wlan0-unique-mac.rules > /dev/null
+    sudo udevadm control --reload-rules
+    ok "udev rule installed — MAC set when wlan0 appears."
 
     # Late MAC fix — xradio-station-mode sets MAC at boot, but another service (e.g. NM or
     # wpa_supplicant) may bring up wlan0 afterward and reset it. This service runs ~10s
@@ -615,7 +716,7 @@ EOF
 Description=Run WiFi Watchdog every 2 minutes
 
 [Timer]
-OnBootSec=60
+OnBootSec=90
 OnUnitActiveSec=2min
 Unit=wifi-watchdog.service
 
@@ -910,6 +1011,17 @@ EOF
         ok "CPU governor already in rc.local. Skipping."
     fi
 
+    # Unique MAC fix via cron @reboot — cron runs at boot, this runs 90s later.
+    # More reliable than rc.local (disabled by default on Debian 11) or systemd timers.
+    info "Adding cron @reboot job for unique MAC fix..."
+    CRON_LINE="@reboot sleep 90 && /usr/local/bin/xradio-station-mode.sh"
+    if ! sudo crontab -l 2>/dev/null | grep -q "xradio-station-mode"; then
+        (sudo crontab -l 2>/dev/null; echo "$CRON_LINE") | sudo crontab -
+        ok "Cron @reboot added (runs 90s after boot)."
+    else
+        ok "Cron @reboot for MAC fix already present."
+    fi
+
     # --- tmpfs for /tmp only ---
     # Moves /tmp to RAM to reduce SD card write cycles.
     # NOTE: /var/log is intentionally NOT put on tmpfs. KlipperScreen, Xorg,
@@ -1150,6 +1262,7 @@ main() {
     echo "       disable unused services"
     echo "  [6] Log Rotation (Klipper, Moonraker, Crowsnest, journal cap)"
     echo ""
+    [ "$SKIP_WIFI" = true ] && echo -e "  ${YELLOW}[SAFE MODE] WiFi/MAC changes will be skipped.${NC}" && echo ""
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
     require_sudo
@@ -1168,8 +1281,12 @@ main() {
     echo -e "${GREEN}All steps finished. Summary:${NC}"
     echo ""
     echo "  Camera   → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU, 1280x720)"
-    echo "  WiFi     → Unique MAC per device (fixes multi-pad IP conflicts), power save"
-    echo "             disabled, watchdog timer active (2 min interval)"
+    if [ "$SKIP_WIFI" = true ]; then
+        echo "  WiFi     → SKIPPED (safe mode). Re-run without --skip-wifi to enable."
+    else
+        echo "  WiFi     → Unique MAC per device (fixes multi-pad IP conflicts), power save"
+        echo "             disabled, watchdog timer active (2 min interval)"
+    fi
     echo "  Accel    → ARM toolchain + Python packages installed, sample config written"
     echo "  KIAUH    → Ready at ~/kiauh/kiauh.sh"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
