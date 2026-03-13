@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.2.7"
+SCRIPT_VERSION="1.2.9"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -721,7 +721,7 @@ EOF
     # --- Add /tmp tmpfs with mode=1777 (required for Xorg lock files) ---
     if ! sudo grep -q "tmpfs.*/tmp" "$FSTAB"; then
         printf "\n" | sudo tee -a "$FSTAB" > /dev/null
-        echo "tmpfs   /tmp        tmpfs   defaults,noatime,nosuid,mode=1777,size=64m    0 0" | sudo tee -a "$FSTAB" > /dev/null
+        echo "tmpfs   /tmp        tmpfs   defaults,noatime,nosuid,mode=1777,size=256m    0 0" | sudo tee -a "$FSTAB" > /dev/null
         ok "tmpfs /tmp added to fstab."
     else
         if ! sudo grep "tmpfs.*/tmp" "$FSTAB" | grep -q "mode=1777"; then
@@ -946,11 +946,34 @@ main() {
     echo "             systemd journal capped at 64MB"
     echo ""
     echo -e "${YELLOW}Next steps:${NC}"
-    echo "  1. Run  ~/kiauh/kiauh.sh  to install Klipper, Moonraker, Mainsail, Crowsnest"
+    echo "  1. Launch KIAUH to install Klipper, Moonraker, Mainsail, Crowsnest"
+    echo "     (use the option below to launch with TMPDIR fix for OctoEverywhere)"
     echo "  2. After Klipper is installed, re-run this script to complete host MCU setup"
     echo "  3. Review ~/printer_data/config/adxl345_sample.cfg and merge into printer.cfg"
     echo "  4. Reboot:  sudo reboot"
     echo ""
+    echo -e "${YELLOW}TIP:${NC} When installing OctoEverywhere via KIAUH Extensions,"
+    echo "     launch KIAUH with TMPDIR set to avoid 'No space left on device' errors."
+    echo "     pip uses /tmp for builds which is limited to 256MB on tmpfs."
+    echo ""
+
+    # --- Offer to launch KIAUH with TMPDIR fix ---
+    read -p "  Launch KIAUH now (with TMPDIR fix for OctoEverywhere)? [Y/n]: " LAUNCH_KIAUH
+    LAUNCH_KIAUH="${LAUNCH_KIAUH:-Y}"
+    case "${LAUNCH_KIAUH}" in
+        [Yy]*)
+            info "Launching KIAUH with TMPDIR=/home/sonic/tmp ..."
+            mkdir -p ~/tmp
+            export TMPDIR=~/tmp
+            ~/kiauh/kiauh.sh
+            ;;
+        *)
+            echo ""
+            ok "Skipping KIAUH launch. To launch manually with the TMPDIR fix:"
+            echo "     mkdir -p ~/tmp && export TMPDIR=~/tmp && ~/kiauh/kiauh.sh"
+            echo ""
+            ;;
+    esac
 }
 
 main "$@"
