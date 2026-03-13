@@ -11,7 +11,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | | What Gets Done |
 |---|---|
 | 🎥 **Nebula Camera** | Installs Crowsnest if missing, writes a working `crowsnest.conf` (YUYV/CPU, 1280x720 @ 15fps), and patches `ustreamer.sh` to stop MJPEG/HW auto-detection that conflicts with the SonicPad's EHCI USB controller |
-| 📶 **WiFi Stability** | Assigns a unique MAC per device (fixes multi-pad IP conflicts when SonicPads share the same hardware MAC): tries U-Boot `wifi_mac` first (persists in boot env, applied at kernel boot), falls back to userspace if needed. Disables XRadio power save (the #1 cause of long-print disconnections), and installs a systemd watchdog timer that auto-recovers `wlan0` every 2 minutes if connectivity drops |
+| 📶 **WiFi Stability** | Assigns a unique MAC per device (fixes multi-pad IP conflicts): udev + delayed set-unique-mac (no driver reload at boot). Disables XRadio power save (the #1 cause of long-print disconnections), and installs a watchdog timer that auto-recovers `wlan0` every 2 minutes if connectivity drops |
 | 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, builds and flashes the Linux process MCU, creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
@@ -203,7 +203,7 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 
 | Problem | Fix |
 |---|---|
-| WiFi broken / lost SSH after script | Connect via monitor+keyboard or Ethernet. Remove WiFi changes: `sudo crontab -e` (delete the `@reboot` xradio line), `sudo rm /etc/udev/rules.d/99-wlan0-unique-mac.rules`, `sudo rm -f /etc/fw_env.config`, `sudo systemctl disable fix-mac-at-boot.timer`, `sudo reboot`. Or reflash and use `./install.sh --skip-wifi` next time. |
+| WiFi broken / lost SSH after script | Connect via monitor+keyboard or Ethernet. Remove WiFi changes: `sudo crontab -e` (delete any `@reboot` xradio line), `sudo rm /etc/udev/rules.d/99-wlan0-unique-mac.rules`, `sudo rm -f /etc/fw_env.config`, `sudo systemctl disable fix-mac-at-boot.timer 2>/dev/null`, `sudo reboot`. Or reflash and use `./install.sh --skip-wifi` next time. |
 | Camera shows "No Signal" | Confirm `/dev/video0` exists: `ls /dev/video*`. If missing, the Nebula camera isn't detected at USB level — check the cable. |
 | `crowsnest.conf` not written | `~/printer_data/config` doesn't exist yet — install Moonraker via KIAUH first, then re-run the script. |
 | `ustreamer.sh` patch failed | Manually edit `~/crowsnest/libs/ustreamer.sh` around line 58 — change `-m MJPEG --encoder=HW` to `-m YUYV --encoder=CPU` |
@@ -218,6 +218,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.3.6
+- Fixed: WiFi now works out of the box. Removed aggressive boot-time WiFi changes (xradio-station-mode.service, fix-mac-at-boot.timer, cron @reboot) that stopped wpa_supplicant and reloaded the driver repeatedly — WiFi never had a chance to connect. Now uses only: udev (set MAC when wlan0 appears), set-unique-mac.service (gentle ip link down/address/up at 30s), power save off, watchdog for recovery. xradio-station-mode.sh kept for watchdog hard recovery when already offline.
 
 ### v1.3.5
 - Added: U-Boot `fw_setenv wifi_mac` — tries to set MAC in boot env (SonicPad firmware passes `wifi_mac` to kernel). If it works, MAC is applied at kernel boot. Falls back to userspace (udev, xradio-station-mode, cron) if fw_setenv fails or offset is wrong.

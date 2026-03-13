@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.3.6"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -112,6 +112,12 @@ fix_ssl() {
     fi
     git config --global http.sslVerify false 2>/dev/null || true
     ok "Git SSL verification disabled globally as fallback."
+    # Sync system clock — "certificate is not yet valid" usually means wrong date
+    info "Syncing system clock (fixes pip SSL 'certificate not yet valid')..."
+    if sudo timedatectl set-ntp true 2>/dev/null; then
+        sleep 2
+    fi
+    sudo ntpdate pool.ntp.org 2>/dev/null || true
 }
 
 # =============================================================================
@@ -313,106 +319,44 @@ setup_wifi() {
     fi
     banner "WiFi Stability Setup"
 
-    # --- Force station mode at boot ---
-    # The XRadio chip (wlan0) on the SonicPad sometimes initializes in P2P mode
-    # instead of managed/station mode. When this happens the interface appears
-    # connected but has no network access and can take forever to switch over,
-    # or never does. Forcing station mode before wpa_supplicant starts fixes this.
-    info "Installing xradio-station-mode.service (fixes P2P boot issue)..."
-    sudo tee "${SYSTEMD_DIR}/xradio-station-mode.service" > /dev/null << 'EOF'
-[Unit]
-Description=Force XRadio wlan0 into station mode before wpa_supplicant
-Before=wpa_supplicant.service network.target
-After=sys-subsystem-net-devices-wlan0.device
-Wants=sys-subsystem-net-devices-wlan0.device
+    # --- Minimal WiFi setup: no driver reload at boot (was breaking connectivity) ---
+    # We use only: udev (set MAC when wlan0 appears) + delayed set-unique-mac (gentle
+    # ip link down/address/up). The old xradio-station-mode (rmmod/modprobe) ran at boot
+    # and 60s/90s later — it killed wpa_supplicant repeatedly and WiFi never connected.
+    # xradio-station-mode.sh is kept for watchdog recovery only (when already offline).
+    info "Installing minimal WiFi config (no boot-time driver reload)..."
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/xradio-station-mode.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # Write the station mode script — detects correct module name at runtime
-    # Also sets unique MAC per device (SonicPad uses wpa_supplicant, not NetworkManager,
-    # so NetworkManager's cloned-mac config is ignored — we must set it on the interface)
+    # Write xradio-station-mode.sh for watchdog recovery only — NOT run at boot
     sudo tee /usr/local/bin/xradio-station-mode.sh > /dev/null << 'STATIONMODE'
 #!/bin/bash
-# Force XRadio WiFi chip into station (managed) mode
-# Handles both xr819_wlan and xradio_wlan module names
-# Sets unique MAC per device (derived from machine-id) for multi-pad DHCP
-
+# Nuclear WiFi recovery: reload XRadio driver. Use only when already offline.
+# Do NOT run at boot — breaks connectivity. Watchdog uses this for hard recovery.
 IFACE="wlan0"
-
-# Detect which module name is in use
-if lsmod | grep -q "xr819_wlan"; then
-    MOD="xr819_wlan"
-elif lsmod | grep -q "xradio_wlan"; then
-    MOD="xradio_wlan"
-else
-    MOD="xradio"
-fi
-
-# Stop wpa_supplicant first — prevents it from reinitializing interface and resetting MAC
+if lsmod | grep -q "xr819_wlan"; then MOD="xr819_wlan"
+elif lsmod | grep -q "xradio_wlan"; then MOD="xradio_wlan"
+else MOD="xradio"; fi
 systemctl stop wpa_supplicant 2>/dev/null || true
 ip link set "$IFACE" down 2>/dev/null || true
 rmmod "$MOD" 2>/dev/null || true
 sleep 2
 modprobe "$MOD" 2>/dev/null || true
 sleep 3
-ip link set "$IFACE" down 2>/dev/null || true
-iw dev "$IFACE" set type station 2>/dev/null || true
-
-# Set unique MAC per device — SonicPad uses wpa_supplicant, not NetworkManager.
-# DHCP uses MAC for lease assignment; identical hardware MACs = same IP on all pads.
-MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
 HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
-if [ -n "${HASH}" ]; then
-    CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
-    ip link set "$IFACE" address "$CLONED_MAC" 2>/dev/null || true
-fi
-
+[ -n "${HASH}" ] && ip link set "$IFACE" address "02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}" 2>/dev/null || true
+iw dev "$IFACE" set type station 2>/dev/null || true
 ip link set "$IFACE" up 2>/dev/null || true
 iw dev "$IFACE" set power_save off 2>/dev/null || true
 systemctl start wpa_supplicant 2>/dev/null || true
 sleep 5
 STATIONMODE
     sudo chmod +x /usr/local/bin/xradio-station-mode.sh
-    sudo systemctl daemon-reload
-    sudo systemctl enable xradio-station-mode.service
-    # Do NOT start during install — the script stops wpa_supplicant and reloads the
-    # WiFi driver, which drops SSH over WiFi and can hang. Service runs at next boot.
-    ok "xradio-station-mode.service enabled (runs at boot)."
 
-    # Delayed MAC fix — run xradio-station-mode 60s after boot via timer. Other
-    # services may bring up wlan0 with hardware MAC first. Timer is more reliable
-    # than a service with sleep for delayed boot execution.
-    info "Installing fix-mac-at-boot (timer, runs 60s after boot)..."
-    sudo tee "${SYSTEMD_DIR}/fix-mac-at-boot.service" > /dev/null << 'EOF'
-[Unit]
-Description=Fix unique MAC on wlan0 (multi-pad IP)
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/xradio-station-mode.sh
-EOF
-    sudo tee "${SYSTEMD_DIR}/fix-mac-at-boot.timer" > /dev/null << 'EOF'
-[Unit]
-Description=Run fix-mac-at-boot 60s after boot
-
-[Timer]
-OnBootSec=60
-Persistent=false
-
-[Install]
-WantedBy=timers.target
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable fix-mac-at-boot.timer
-    sudo systemctl start fix-mac-at-boot.timer 2>/dev/null || true
-    ok "fix-mac-at-boot.timer enabled (runs 60s after boot)."
+    # Disable/remove old aggressive boot services if present from previous script run
+    sudo systemctl disable xradio-station-mode.service 2>/dev/null || true
+    sudo systemctl disable fix-mac-at-boot.timer 2>/dev/null || true
+    sudo rm -f "${SYSTEMD_DIR}/xradio-station-mode.service" "${SYSTEMD_DIR}/fix-mac-at-boot.service" "${SYSTEMD_DIR}/fix-mac-at-boot.timer" 2>/dev/null || true
+    (sudo crontab -l 2>/dev/null || true) | grep -v "xradio-station-mode" | sudo crontab - 2>/dev/null || true
 
     # --- Disable power save immediately ---
     # Tell NetworkManager to ignore p2p0 — prevents it from grabbing p2p0
@@ -513,15 +457,14 @@ SETMACUDEV
     sudo udevadm control --reload-rules
     ok "udev rule installed — MAC set when wlan0 appears."
 
-    # Late MAC fix — xradio-station-mode sets MAC at boot, but another service (e.g. NM or
-    # wpa_supplicant) may bring up wlan0 afterward and reset it. This service runs ~10s
-    # after network.target and reapplies the unique MAC, ensuring it sticks.
-    info "Installing set-unique-mac.service (ensures unique MAC persists at boot)..."
+    # Late MAC fix — udev sets MAC when wlan0 appears; this reapplies if something
+    # overwrote it. Runs 30s after boot to avoid disrupting initial connection.
+    info "Installing set-unique-mac.service (gentle MAC fix 30s after boot)..."
     sudo tee /usr/local/bin/set-unique-mac.sh > /dev/null << 'SETMAC'
 #!/bin/bash
 IFACE="wlan0"
 [ ! -e "/sys/class/net/${IFACE}" ] && exit 0
-MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
 HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
 [ -z "${HASH}" ] && exit 0
 CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
@@ -539,7 +482,7 @@ After=network.target wpa_supplicant.service NetworkManager.service
 
 [Service]
 Type=oneshot
-ExecStartPre=/bin/sleep 10
+ExecStartPre=/bin/sleep 30
 ExecStart=/usr/local/bin/set-unique-mac.sh
 RemainAfterExit=yes
 
@@ -562,8 +505,7 @@ EOF
     sudo tee "${SYSTEMD_DIR}/wifi-powersave-off.service" > /dev/null << 'EOF'
 [Unit]
 Description=Disable WiFi Power Save on wlan0
-After=xradio-station-mode.service
-Wants=xradio-station-mode.service
+After=network.target wpa_supplicant.service
 
 [Service]
 Type=oneshot
@@ -645,39 +587,7 @@ reload_xradio_module() {
     dhclient "$INTERFACE" -1 2>/dev/null || true
 }
 
-# Ensure unique MAC is applied — something at boot may overwrite it.
-# XRadio driver may not allow MAC change on a live interface; use full
-# xradio-station-mode.sh (rmmod/modprobe) which we know works.
 rm -f "$MAC_CORRECTED_FILE" 2>/dev/null || true
-EXPECTED_MAC=""
-if [ -f /etc/machine-id ]; then
-    HASH=$(echo -n "$(cat /etc/machine-id)" | md5sum 2>/dev/null | cut -c1-10)
-    [ -n "$HASH" ] && EXPECTED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
-fi
-if [ -n "$EXPECTED_MAC" ] && [ -e "/sys/class/net/${INTERFACE}/address" ]; then
-    CURRENT=$(cat "/sys/class/net/${INTERFACE}/address" 2>/dev/null)
-    if [ "$CURRENT" != "$EXPECTED_MAC" ]; then
-        log "INFO: Correcting MAC ($CURRENT -> $EXPECTED_MAC) via xradio-station-mode"
-        if [ -x /usr/local/bin/xradio-station-mode.sh ]; then
-            /usr/local/bin/xradio-station-mode.sh || log "WARN: xradio-station-mode.sh exited with error"
-            sleep 2
-            ACTUAL=$(cat "/sys/class/net/${INTERFACE}/address" 2>/dev/null)
-            if [ "$ACTUAL" = "$EXPECTED_MAC" ]; then
-                log "INFO: MAC verified as $EXPECTED_MAC"
-            else
-                log "WARN: MAC still $ACTUAL after xradio-station-mode (expected $EXPECTED_MAC)"
-            fi
-            touch "$MAC_CORRECTED_FILE" && log "INFO: Created $MAC_CORRECTED_FILE (will skip recovery)"
-        else
-            log "ERROR: xradio-station-mode.sh not found or not executable"
-        fi
-        sleep 5
-        systemctl start wpa_supplicant 2>/dev/null || true
-        sleep 10
-        dhclient "$INTERFACE" -1 2>/dev/null || true
-        sleep 5
-    fi
-fi
 
 # Read consecutive fail count
 FAILS=0
@@ -824,13 +734,16 @@ setup_accelerometer() {
 
         if [ "${NUMPY_OK}" != true ] || [ "${SCIPY_OK}" != true ]; then
             info "Installing numpy and scipy into klippy-env..."
+            # --trusted-host bypasses SSL verify — fixes "certificate is not yet valid"
+            # (often caused by wrong system clock on fresh flash)
+            PIP_TRUSTED="--trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host www.piwheels.org"
             if [ "${NUMPY_OK}" != true ]; then
                 "${KLIPPY_PIP}" uninstall numpy -y 2>/dev/null || true
-                "${KLIPPY_PIP}" install "numpy<2" && ok "numpy<2 installed into klippy-env." || warn "numpy install failed."
+                "${KLIPPY_PIP}" install $PIP_TRUSTED "numpy<2" && ok "numpy<2 installed into klippy-env." || warn "numpy install failed."
                 NUMPY_SCIPY_INSTALLED=true
             fi
             if [ "${SCIPY_OK}" != true ]; then
-                "${KLIPPY_PIP}" install scipy && ok "scipy installed into klippy-env." || warn "scipy install failed."
+                "${KLIPPY_PIP}" install $PIP_TRUSTED scipy && ok "scipy installed into klippy-env." || warn "scipy install failed."
                 NUMPY_SCIPY_INSTALLED=true
             fi
         fi
@@ -1039,17 +952,6 @@ EOF
         ok "CPU governor persistence written to /etc/rc.local."
     else
         ok "CPU governor already in rc.local. Skipping."
-    fi
-
-    # Unique MAC fix via cron @reboot — cron runs at boot, this runs 90s later.
-    # More reliable than rc.local (disabled by default on Debian 11) or systemd timers.
-    info "Adding cron @reboot job for unique MAC fix..."
-    CRON_LINE="@reboot sleep 90 && /usr/local/bin/xradio-station-mode.sh"
-    if ! sudo crontab -l 2>/dev/null | grep -q "xradio-station-mode"; then
-        (sudo crontab -l 2>/dev/null; echo "$CRON_LINE") | sudo crontab -
-        ok "Cron @reboot added (runs 90s after boot)."
-    else
-        ok "Cron @reboot for MAC fix already present."
     fi
 
     # --- tmpfs for /tmp only ---
