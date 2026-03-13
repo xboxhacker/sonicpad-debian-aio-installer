@@ -91,7 +91,12 @@ setup_hostname() {
 # =============================================================================
 fix_ssl() {
     info "Fixing SSL certificate verification..."
-    sudo apt-get install -y ca-certificates -qq 2>/dev/null &&         sudo update-ca-certificates -f 2>/dev/null &&         ok "CA certificates updated." ||         warn "CA cert update failed — using git SSL bypass as fallback."
+    if dpkg -l ca-certificates &>/dev/null; then
+        ok "ca-certificates already installed."
+        sudo update-ca-certificates -f 2>/dev/null || true
+    else
+        sudo apt-get install -y ca-certificates -qq 2>/dev/null && sudo update-ca-certificates -f 2>/dev/null && ok "CA certificates installed." || warn "CA cert install failed — using git SSL bypass as fallback."
+    fi
     git config --global http.sslVerify false 2>/dev/null || true
     ok "Git SSL verification disabled globally as fallback."
 }
@@ -164,13 +169,18 @@ setup_nebula_camera() {
         git -c http.sslVerify=false clone https://github.com/mainsail-crew/crowsnest.git "${CROWSNEST_DIR}" || { err "Crowsnest clone failed. Check network and SSL certs."; return; }
 
         # Build ustreamer binary only — non-interactive, no sudo make install
-        info "Building ustreamer (this may take a few minutes)..."
-        cd "${CROWSNEST_DIR}"
-        make build 2>/dev/null && ok "ustreamer built." || {
-            warn "make build failed — trying bin/ustreamer directly..."
-            make -C bin/ustreamer 2>/dev/null && ok "ustreamer built (fallback)." ||                 warn "ustreamer build failed. Try running: cd ~/crowsnest && make build"
-        }
-        cd - > /dev/null
+        USTREAMER_BIN="${CROWSNEST_DIR}/bin/ustreamer/ustreamer"
+        if [ -x "${USTREAMER_BIN}" ]; then
+            ok "ustreamer binary already built."
+        else
+            info "Building ustreamer (this may take a few minutes)..."
+            cd "${CROWSNEST_DIR}"
+            make build 2>/dev/null && ok "ustreamer built." || {
+                warn "make build failed — trying bin/ustreamer directly..."
+                make -C bin/ustreamer 2>/dev/null && ok "ustreamer built (fallback)." || warn "ustreamer build failed. Try running: cd ~/crowsnest && make build"
+            }
+            cd - > /dev/null
+        fi
 
         # Install crowsnest as a service non-interactively
         # crowsnest ships a pre-built .service file we can copy directly
@@ -280,10 +290,13 @@ WantedBy=multi-user.target
 EOF
 
     # Write the station mode script — detects correct module name at runtime
+    # Also sets unique MAC per device (SonicPad uses wpa_supplicant, not NetworkManager,
+    # so NetworkManager's cloned-mac config is ignored — we must set it on the interface)
     sudo tee /usr/local/bin/xradio-station-mode.sh > /dev/null << 'STATIONMODE'
 #!/bin/bash
 # Force XRadio WiFi chip into station (managed) mode
 # Handles both xr819_wlan and xradio_wlan module names
+# Sets unique MAC per device (derived from machine-id) for multi-pad DHCP
 
 IFACE="wlan0"
 
@@ -304,6 +317,16 @@ modprobe "$MOD" 2>/dev/null || true
 sleep 3
 ip link set "$IFACE" down 2>/dev/null || true
 iw dev "$IFACE" set type station 2>/dev/null || true
+
+# Set unique MAC per device — SonicPad uses wpa_supplicant, not NetworkManager.
+# DHCP uses MAC for lease assignment; identical hardware MACs = same IP on all pads.
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
+HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
+if [ -n "${HASH}" ]; then
+    CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
+    ip link set "$IFACE" address "$CLONED_MAC" 2>/dev/null || true
+fi
+
 ip link set "$IFACE" up 2>/dev/null || true
 iw dev "$IFACE" set power_save off 2>/dev/null || true
 STATIONMODE
@@ -414,10 +437,20 @@ check_ping() {
     ping -I "$INTERFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$TEST_HOST" > /dev/null 2>&1
 }
 
+set_unique_mac() {
+    MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
+    HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
+    if [ -n "${HASH}" ]; then
+        CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
+        ip link set "$INTERFACE" address "$CLONED_MAC" 2>/dev/null || true
+    fi
+}
+
 force_station_mode() {
     ip link set "$INTERFACE" down 2>/dev/null
     sleep 1
     iw dev "$INTERFACE" set type station 2>/dev/null || true
+    set_unique_mac
     ip link set "$INTERFACE" up 2>/dev/null
     /usr/sbin/iw dev "$INTERFACE" set power_save off 2>/dev/null || true
 }
@@ -522,49 +555,90 @@ EOF
 setup_accelerometer() {
     banner "Accelerometer / Input Shaper Support"
 
-    info "Installing required packages for ADXL345 and resonance measurement..."
-    sudo apt-get update -qq
-
     # Core ARM toolchain (needed for Klipper MCU compilation on-device)
-    sudo apt-get install -y \
-        binutils-arm-none-eabi \
-        libnewlib-arm-none-eabi \
-        libstdc++-arm-none-eabi-newlib \
-        gcc-arm-none-eabi
-
-    ok "ARM toolchain installed."
+    ARM_PKGS="binutils-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib gcc-arm-none-eabi"
+    ARM_NEEDED=""
+    for pkg in $ARM_PKGS; do
+        dpkg -l "$pkg" &>/dev/null || ARM_NEEDED="$ARM_NEEDED $pkg"
+    done
+    if [ -z "${ARM_NEEDED}" ]; then
+        ok "ARM toolchain already installed."
+    else
+        info "Installing ARM toolchain..."
+        sudo apt-get update -qq
+        sudo apt-get install -y $ARM_PKGS
+        ok "ARM toolchain installed."
+    fi
 
     # libopenblas is required by numpy on ARM. Without it, numpy fails to load
     # even after pip install with: libopenblas.so.0: cannot open shared object file
-    info "Installing libopenblas (required by numpy on ARM)..."
-    sudo apt-get install -y libopenblas-dev
-    ok "libopenblas installed."
+    if dpkg -l libopenblas-dev &>/dev/null; then
+        ok "libopenblas already installed."
+    else
+        info "Installing libopenblas (required by numpy on ARM)..."
+        sudo apt-get update -qq
+        sudo apt-get install -y libopenblas-dev
+        ok "libopenblas installed."
+    fi
 
     # Python packages MUST go into the klippy virtualenv.
     # System pip3 is not used by Klipper — installing there causes
     # "Failed to import numpy" errors at runtime.
     # numpy 2.x fails on this platform (missing libopenblas symbols),
     # so we pin to <2. numpy 1.26.x is the correct version here.
-    info "Installing numpy and scipy into klippy-env..."
     KLIPPY_PIP="/home/sonic/klippy-env/bin/pip"
+    KLIPPY_PY="/home/sonic/klippy-env/bin/python"
+    NUMPY_SCIPY_INSTALLED=false
     if [ -f "${KLIPPY_PIP}" ]; then
-        "${KLIPPY_PIP}" uninstall numpy -y 2>/dev/null || true
-        "${KLIPPY_PIP}" install "numpy<2" && ok "numpy<2 installed into klippy-env." || warn "numpy install failed."
-        "${KLIPPY_PIP}" install scipy && ok "scipy installed into klippy-env." || warn "scipy install failed."
+        # Check if numpy<2 and scipy are already installed and importable
+        NUMPY_OK=false
+        SCIPY_OK=false
+        if "${KLIPPY_PIP}" show numpy &>/dev/null; then
+            NUMPY_VER=$("${KLIPPY_PIP}" show numpy 2>/dev/null | grep -i "^Version:" | awk '{print $2}')
+            if [ -n "${NUMPY_VER}" ] && [ "$(echo "${NUMPY_VER}" | cut -d. -f1)" -lt 2 ] 2>/dev/null; then
+                NUMPY_OK=true
+            fi
+        fi
+        "${KLIPPY_PIP}" show scipy &>/dev/null && SCIPY_OK=true
+
+        if [ "${NUMPY_OK}" = true ] && [ "${SCIPY_OK}" = true ]; then
+            if "${KLIPPY_PY}" -c "import numpy; import scipy" 2>/dev/null; then
+                ok "numpy and scipy already installed and working."
+            else
+                info "numpy/scipy present but import failed — reinstalling..."
+                NUMPY_OK=false
+                SCIPY_OK=false
+            fi
+        fi
+
+        if [ "${NUMPY_OK}" != true ] || [ "${SCIPY_OK}" != true ]; then
+            info "Installing numpy and scipy into klippy-env..."
+            if [ "${NUMPY_OK}" != true ]; then
+                "${KLIPPY_PIP}" uninstall numpy -y 2>/dev/null || true
+                "${KLIPPY_PIP}" install "numpy<2" && ok "numpy<2 installed into klippy-env." || warn "numpy install failed."
+                NUMPY_SCIPY_INSTALLED=true
+            fi
+            if [ "${SCIPY_OK}" != true ]; then
+                "${KLIPPY_PIP}" install scipy && ok "scipy installed into klippy-env." || warn "scipy install failed."
+                NUMPY_SCIPY_INSTALLED=true
+            fi
+        fi
+
         # Verify numpy actually imports — catches libopenblas issues early
-        if /home/sonic/klippy-env/bin/python -c "import numpy" 2>/dev/null; then
+        if "${KLIPPY_PY}" -c "import numpy" 2>/dev/null; then
             ok "numpy import verified."
         else
             warn "numpy installed but import failed — libopenblas may be missing."
             warn "Run: sudo apt-get install -y libopenblas-dev  then re-run this script."
         fi
 
-        # Clean up pip build cache and apt cache — numpy/scipy leave large
-        # build artifacts that can fill the SD card (seen: Errno 28 No space left)
-        info "Cleaning up build cache to free SD card space..."
-        "${KLIPPY_PIP}" cache purge 2>/dev/null || true
-        sudo apt-get clean 2>/dev/null || true
-        ok "Build cache cleared."
+        # Clean up pip build cache and apt cache only if we installed packages
+        if [ "${NUMPY_SCIPY_INSTALLED}" = true ]; then
+            info "Cleaning up build cache to free SD card space..."
+            "${KLIPPY_PIP}" cache purge 2>/dev/null || true
+            sudo apt-get clean 2>/dev/null || true
+            ok "Build cache cleared."
+        fi
     else
         warn "klippy-env not found — install Klipper via KIAUH first, then re-run this script."
         warn "After Klipper is installed, run:"
@@ -887,9 +961,13 @@ EOF
 setup_logrotate() {
     banner "Log Rotation Setup"
 
-    info "Installing logrotate if not present..."
-    sudo apt-get install -y logrotate -qq
-    ok "logrotate ready."
+    if dpkg -l logrotate &>/dev/null; then
+        ok "logrotate already installed."
+    else
+        info "Installing logrotate..."
+        sudo apt-get install -y logrotate -qq
+        ok "logrotate installed."
+    fi
 
     # --- Klipper logs ---
     info "Writing logrotate config for Klipper..."

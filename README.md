@@ -212,6 +212,7 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 
 ### v1.3.3
 - Fixed: multi-pad IP conflict — SonicPads often ship with identical hardware MACs, causing DHCP to assign the same IP to all. Script now derives a unique, stable MAC from `/etc/machine-id` per device so each pad gets its own IP on any network. Run the script on each pad; reboot to apply.
+- Fixed: unique MAC now set directly on wlan0 in `xradio-station-mode.sh` (SonicPad uses wpa_supplicant, not NetworkManager, so the NM config alone was ignored). WiFi watchdog also restores the unique MAC after module reload during recovery.
 
 ### v1.2.2
 - Fixed: script would silently exit on any failed command due to `set -e` — replaced with explicit per-command error handling
