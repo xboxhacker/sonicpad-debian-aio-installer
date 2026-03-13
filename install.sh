@@ -309,7 +309,8 @@ else
     MOD="xradio"
 fi
 
-# Bring interface down, reload module, force station mode, bring back up
+# Stop wpa_supplicant first — prevents it from reinitializing interface and resetting MAC
+systemctl stop wpa_supplicant 2>/dev/null || true
 ip link set "$IFACE" down 2>/dev/null || true
 rmmod "$MOD" 2>/dev/null || true
 sleep 2
@@ -329,6 +330,8 @@ fi
 
 ip link set "$IFACE" up 2>/dev/null || true
 iw dev "$IFACE" set power_save off 2>/dev/null || true
+systemctl start wpa_supplicant 2>/dev/null || true
+sleep 5
 STATIONMODE
     sudo chmod +x /usr/local/bin/xradio-station-mode.sh
     sudo systemctl daemon-reload
@@ -459,6 +462,7 @@ PING_TIMEOUT=5
 LOG="/var/log/wifi-watchdog.log"
 MAX_LOG_LINES=500
 FAIL_COUNT_FILE="/tmp/wifi-watchdog-fails"
+MAC_CORRECTED_FILE="/tmp/wifi-watchdog-mac-corrected"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
@@ -510,6 +514,40 @@ reload_xradio_module() {
     dhclient "$INTERFACE" -1 2>/dev/null || true
 }
 
+# Ensure unique MAC is applied — something at boot may overwrite it.
+# XRadio driver may not allow MAC change on a live interface; use full
+# xradio-station-mode.sh (rmmod/modprobe) which we know works.
+rm -f "$MAC_CORRECTED_FILE" 2>/dev/null || true
+EXPECTED_MAC=""
+if [ -f /etc/machine-id ]; then
+    HASH=$(echo -n "$(cat /etc/machine-id)" | md5sum 2>/dev/null | cut -c1-10)
+    [ -n "$HASH" ] && EXPECTED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
+fi
+if [ -n "$EXPECTED_MAC" ] && [ -e "/sys/class/net/${INTERFACE}/address" ]; then
+    CURRENT=$(cat "/sys/class/net/${INTERFACE}/address" 2>/dev/null)
+    if [ "$CURRENT" != "$EXPECTED_MAC" ]; then
+        log "INFO: Correcting MAC ($CURRENT -> $EXPECTED_MAC) via xradio-station-mode"
+        if [ -x /usr/local/bin/xradio-station-mode.sh ]; then
+            /usr/local/bin/xradio-station-mode.sh || log "WARN: xradio-station-mode.sh exited with error"
+            sleep 2
+            ACTUAL=$(cat "/sys/class/net/${INTERFACE}/address" 2>/dev/null)
+            if [ "$ACTUAL" = "$EXPECTED_MAC" ]; then
+                log "INFO: MAC verified as $EXPECTED_MAC"
+            else
+                log "WARN: MAC still $ACTUAL after xradio-station-mode (expected $EXPECTED_MAC)"
+            fi
+            touch "$MAC_CORRECTED_FILE" && log "INFO: Created $MAC_CORRECTED_FILE (will skip recovery)"
+        else
+            log "ERROR: xradio-station-mode.sh not found or not executable"
+        fi
+        sleep 5
+        systemctl start wpa_supplicant 2>/dev/null || true
+        sleep 10
+        dhclient "$INTERFACE" -1 2>/dev/null || true
+        sleep 5
+    fi
+fi
+
 # Read consecutive fail count
 FAILS=0
 if [ -f "$FAIL_COUNT_FILE" ]; then
@@ -521,7 +559,12 @@ if ! check_ping; then
     echo "$FAILS" > "$FAIL_COUNT_FILE"
     log "WARN: No connectivity on $INTERFACE (consecutive fails: $FAILS). Attempting recovery..."
 
-    if [ "$FAILS" -le 3 ]; then
+    # Skip force_station_mode if we just corrected MAC — it uses ip link set address
+    # which doesn't work on XRadio and would reset MAC back to hardware.
+    if [ -f "$MAC_CORRECTED_FILE" ]; then
+        log "INFO: Skipping recovery (MAC was just corrected, waiting for reconnect)"
+        rm -f "$MAC_CORRECTED_FILE" 2>/dev/null || true
+    elif [ "$FAILS" -le 3 ]; then
         # Soft recovery: force station mode and restart wpa_supplicant
         force_station_mode
         sleep 5
