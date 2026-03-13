@@ -382,8 +382,9 @@ STATIONMODE
     sudo chmod +x /usr/local/bin/xradio-station-mode.sh
     sudo systemctl daemon-reload
     sudo systemctl enable xradio-station-mode.service
-    sudo systemctl start xradio-station-mode.service 2>/dev/null || true
-    ok "xradio-station-mode.service enabled."
+    # Do NOT start during install — the script stops wpa_supplicant and reloads the
+    # WiFi driver, which drops SSH over WiFi and can hang. Service runs at next boot.
+    ok "xradio-station-mode.service enabled (runs at boot)."
 
     # Delayed MAC fix — run xradio-station-mode 60s after boot via timer. Other
     # services may bring up wlan0 with hardware MAC first. Timer is more reliable
