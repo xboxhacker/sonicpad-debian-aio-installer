@@ -11,11 +11,10 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | | What Gets Done |
 |---|---|
 | 🎥 **Nebula Camera** | Installs Crowsnest if missing, writes a working `crowsnest.conf` (YUYV/CPU, 1280x720 @ 15fps), and patches `ustreamer.sh` to stop MJPEG/HW auto-detection that conflicts with the SonicPad's EHCI USB controller |
-| 📶 **WiFi Stability** | Assigns a unique MAC per device (fixes multi-pad IP conflicts): udev + delayed set-unique-mac (no driver reload at boot). Disables XRadio power save (the #1 cause of long-print disconnections), and installs a watchdog timer that auto-recovers `wlan0` every 2 minutes if connectivity drops |
 | 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, builds and flashes the Linux process MCU, creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
-| 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest, and the WiFi watchdog (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
+| 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
 
 ---
 
@@ -39,14 +38,6 @@ cd sonicpad-debian-aio-installer
 chmod +x install.sh
 ./install.sh
 ```
-
-**Safe mode (fresh flash):** If you're on a freshly flashed pad and want to avoid any WiFi/MAC changes that could break connectivity, run with `--skip-wifi`:
-
-```bash
-./install.sh --skip-wifi
-```
-
-This skips all WiFi setup (unique MAC, power save, watchdog). Re-run without the flag later to enable WiFi features once you're confident the pad is stable.
 
 > **Note:** The `ca-certificates` line fixes SSL verification failures that are common on fresh SonicPad-Debian images. The script handles this automatically on subsequent runs.
 
@@ -130,12 +121,6 @@ curl http://localhost:8080/state
 ```
 Look for `"online": true` and `captured_fps` close to 30 with `queued_fps` at 15.
 
-**WiFi watchdog:**
-```bash
-systemctl status wifi-watchdog.timer
-/usr/sbin/iw dev wlan0 get power_save   # should say: Power save: off
-```
-
 **CPU governor:**
 ```bash
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor   # should say: performance
@@ -203,11 +188,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 
 | Problem | Fix |
 |---|---|
-| WiFi broken / lost SSH after script | Connect via monitor+keyboard or Ethernet. Remove WiFi changes: `sudo crontab -e` (delete any `@reboot` xradio line), `sudo rm /etc/udev/rules.d/99-wlan0-unique-mac.rules`, `sudo rm -f /etc/fw_env.config`, `sudo systemctl disable fix-mac-at-boot.timer 2>/dev/null`, `sudo reboot`. Or reflash and use `./install.sh --skip-wifi` next time. |
 | Camera shows "No Signal" | Confirm `/dev/video0` exists: `ls /dev/video*`. If missing, the Nebula camera isn't detected at USB level — check the cable. |
 | `crowsnest.conf` not written | `~/printer_data/config` doesn't exist yet — install Moonraker via KIAUH first, then re-run the script. |
 | `ustreamer.sh` patch failed | Manually edit `~/crowsnest/libs/ustreamer.sh` around line 58 — change `-m MJPEG --encoder=HW` to `-m YUYV --encoder=CPU` |
-| WiFi still dropping | Check `dmesg \| grep "sunxi-mmc sdc1.*err"` — excessive SDIO errors may point to a hardware or power supply issue beyond software fixes. |
 | `mcu rpi: Unable to open port` | `klipper-mcu` service isn't running. Check: `sudo systemctl status klipper-mcu` and `ls /tmp/klipper_host_mcu` |
 | `Unable to open spi device` | spidev permissions not set. Run: `sudo chmod 666 /dev/spidev2.0` and verify udev rule exists at `/etc/udev/rules.d/99-spidev.rules` |
 | `Failed to import numpy` | numpy not in klippy-env or wrong version. Run: `sudo apt-get install -y libopenblas-dev && ~/klippy-env/bin/pip uninstall numpy -y && ~/klippy-env/bin/pip install "numpy<2"` |
@@ -218,6 +201,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.4.0
+- Removed: All WiFi-related setup (unique MAC, power save, watchdog, udev, NetworkManager configs). Configure WiFi manually via nmtui, KlipperScreen, or wpa_supplicant. Hostname setup retained.
 
 ### v1.3.7
 - Fixed: WiFi watchdog no longer disrupts when wlan0 has IP but ping fails (e.g. no internet, local network). Only runs recovery when wlan0 has no IP (actually disconnected). Added 15-min backoff after failed recovery to stop the on/off loop.

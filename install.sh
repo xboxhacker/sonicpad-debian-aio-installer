@@ -3,7 +3,6 @@
 #  SonicPad Debian All-In-One Setup Script
 #  Covers:
 #    - Creality Nebula Camera (crowsnest YUYV/CPU + ustreamer.sh patch)
-#    - WiFi Watchdog (power save off + auto-reconnect service)
 #    - Accelerometer support (ADXL345 / input shaper packages)
 #    - KIAUH installation
 #    - System/OS performance tuning:
@@ -15,23 +14,10 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.3.7"
+SCRIPT_VERSION="1.4.0"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
-SKIP_WIFI=false
-
-# Parse flags: --skip-wifi or --safe-mode skips all WiFi/MAC changes (use after fresh flash)
-for arg in "$@"; do
-    case "$arg" in
-        --skip-wifi|--safe-mode) SKIP_WIFI=true ;;
-        -h|--help)
-            echo "Usage: $0 [--skip-wifi|--safe-mode]"
-            echo "  --skip-wifi, --safe-mode  Skip WiFi setup and MAC changes (recommended for fresh flash)"
-            exit 0
-            ;;
-    esac
-done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -310,375 +296,7 @@ EOF
 }
 
 # =============================================================================
-# SECTION 2: WiFi Watchdog
-# =============================================================================
-setup_wifi() {
-    if [ "$SKIP_WIFI" = true ]; then
-        warn "Skipping WiFi setup (--skip-wifi or --safe-mode). Run without flag to enable."
-        return 0
-    fi
-    banner "WiFi Stability Setup"
-
-    # --- Minimal WiFi setup: no driver reload at boot (was breaking connectivity) ---
-    # We use only: udev (set MAC when wlan0 appears) + delayed set-unique-mac (gentle
-    # ip link down/address/up). The old xradio-station-mode (rmmod/modprobe) ran at boot
-    # and 60s/90s later — it killed wpa_supplicant repeatedly and WiFi never connected.
-    # xradio-station-mode.sh is kept for watchdog recovery only (when already offline).
-    info "Installing minimal WiFi config (no boot-time driver reload)..."
-
-    # Write xradio-station-mode.sh for watchdog recovery only — NOT run at boot
-    sudo tee /usr/local/bin/xradio-station-mode.sh > /dev/null << 'STATIONMODE'
-#!/bin/bash
-# Nuclear WiFi recovery: reload XRadio driver. Use only when already offline.
-# Do NOT run at boot — breaks connectivity. Watchdog uses this for hard recovery.
-IFACE="wlan0"
-if lsmod | grep -q "xr819_wlan"; then MOD="xr819_wlan"
-elif lsmod | grep -q "xradio_wlan"; then MOD="xradio_wlan"
-else MOD="xradio"; fi
-systemctl stop wpa_supplicant 2>/dev/null || true
-ip link set "$IFACE" down 2>/dev/null || true
-rmmod "$MOD" 2>/dev/null || true
-sleep 2
-modprobe "$MOD" 2>/dev/null || true
-sleep 3
-MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
-HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
-[ -n "${HASH}" ] && ip link set "$IFACE" address "02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}" 2>/dev/null || true
-iw dev "$IFACE" set type station 2>/dev/null || true
-ip link set "$IFACE" up 2>/dev/null || true
-iw dev "$IFACE" set power_save off 2>/dev/null || true
-systemctl start wpa_supplicant 2>/dev/null || true
-sleep 5
-STATIONMODE
-    sudo chmod +x /usr/local/bin/xradio-station-mode.sh
-
-    # Disable/remove old aggressive boot services if present from previous script run
-    sudo systemctl disable xradio-station-mode.service 2>/dev/null || true
-    sudo systemctl disable fix-mac-at-boot.timer 2>/dev/null || true
-    sudo rm -f "${SYSTEMD_DIR}/xradio-station-mode.service" "${SYSTEMD_DIR}/fix-mac-at-boot.service" "${SYSTEMD_DIR}/fix-mac-at-boot.timer" 2>/dev/null || true
-    (sudo crontab -l 2>/dev/null || true) | grep -v "xradio-station-mode" | sudo crontab - 2>/dev/null || true
-
-    # --- Disable power save immediately ---
-    # Tell NetworkManager to ignore p2p0 — prevents it from grabbing p2p0
-    # at boot instead of wlan0 (root cause of "boots to P2P" issue)
-    info "Configuring NetworkManager to ignore p2p0 interface..."
-    sudo mkdir -p /etc/NetworkManager/conf.d
-    sudo tee /etc/NetworkManager/conf.d/99-ignore-p2p.conf > /dev/null << 'NMCONF'
-[keyfile]
-unmanaged-devices=interface-name:p2p0
-NMCONF
-    ok "NetworkManager will ignore p2p0 at boot."
-
-    # Unique MAC per device — SonicPads often ship with identical hardware MACs.
-    # When multiple pads share the same MAC, DHCP assigns the same IP to all.
-    # We derive a unique, stable MAC from /etc/machine-id (unique per device)
-    # so each pad gets its own IP on any network. Uses locally-administered
-    # prefix 02: so it's valid and won't conflict with real hardware.
-    #
-    # PREFERRED: U-Boot wifi_mac — SonicPad firmware (env.cfg) passes wifi_mac to kernel
-    # via boot args. If fw_setenv works, the MAC is set at boot before any userspace.
-    # FALLBACK: userspace (udev, xradio-station-mode, cron, timer) if U-Boot env fails.
-    info "Configuring unique WiFi MAC per device (fixes multi-pad IP conflicts)..."
-    MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
-    HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
-    CLONED_MAC=""
-    if [ -n "${HASH}" ]; then
-        CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
-    fi
-
-    # --- Try U-Boot fw_setenv first (kernel gets wifi_mac at boot) ---
-    UBOOT_MAC_OK=false
-    if [ -n "${CLONED_MAC}" ] && [ -b /dev/mmcblk0 ]; then
-        info "Attempting U-Boot wifi_mac (persists in boot env, applied at kernel boot)..."
-        if ! dpkg -l u-boot-tools &>/dev/null; then
-            sudo apt-get update -qq 2>/dev/null
-            sudo apt-get install -y u-boot-tools -qq 2>/dev/null || true
-        fi
-        if command -v fw_printenv &>/dev/null; then
-            # SonicPad sys_config: env at block 9216 (512 bytes), size 1024 blocks
-            # Byte offset: 9216*512 = 4718592 = 0x480000. Env size typically 0x20000.
-            if [ ! -f /etc/fw_env.config ]; then
-                echo "/dev/mmcblk0 0x480000 0x20000" | sudo tee /etc/fw_env.config > /dev/null
-            fi
-            if [ -f /etc/fw_env.config ]; then
-                FW_ERR=$(sudo fw_printenv 2>&1)
-                if ! echo "$FW_ERR" | grep -qi "bad crc\|cannot read\|error"; then
-                    if sudo fw_setenv wifi_mac "${CLONED_MAC}" 2>/dev/null; then
-                        UBOOT_MAC_OK=true
-                        ok "U-Boot wifi_mac set to ${CLONED_MAC} (will apply at next reboot)."
-                    fi
-                fi
-            fi
-        fi
-        if [ "$UBOOT_MAC_OK" = false ]; then
-            warn "U-Boot wifi_mac not available (fw_setenv failed or wrong offset). Using userspace fallback."
-        fi
-    fi
-
-    # --- Userspace MAC config (NetworkManager, udev, services) — used if U-Boot failed or as backup ---
-    if [ -n "${CLONED_MAC}" ]; then
-        sudo tee /etc/NetworkManager/conf.d/99-unique-mac-per-device.conf > /dev/null << NMRAND
-[device]
-wifi.scan-rand-mac-address=no
-
-[connection]
-wifi.cloned-mac-address=${CLONED_MAC}
-NMRAND
-        ok "Unique MAC ${CLONED_MAC} configured (derived from machine-id)."
-    else
-        warn "Could not generate unique MAC — falling back to permanent hardware MAC."
-        sudo tee /etc/NetworkManager/conf.d/99-unique-mac-per-device.conf > /dev/null << 'NMRAND'
-[device]
-wifi.scan-rand-mac-address=no
-
-[connection]
-wifi.cloned-mac-address=permanent
-NMRAND
-    fi
-
-    # Remove legacy config if present (script used to write 99-no-mac-randomize.conf)
-    sudo rm -f /etc/NetworkManager/conf.d/99-no-mac-randomize.conf 2>/dev/null || true
-
-    # udev rule — set unique MAC the instant wlan0 appears (before wpa_supplicant etc.)
-    # This catches the interface at creation time, when the driver first loads.
-    info "Installing udev rule for unique MAC on wlan0..."
-    sudo tee /usr/local/bin/set-unique-mac-udev.sh > /dev/null << 'SETMACUDEV'
-#!/bin/bash
-IFACE="${1:-wlan0}"
-[ ! -e "/sys/class/net/${IFACE}" ] && exit 0
-MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
-HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
-[ -z "${HASH}" ] && exit 0
-CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
-ip link set "$IFACE" address "$CLONED_MAC" 2>/dev/null || true
-SETMACUDEV
-    sudo chmod +x /usr/local/bin/set-unique-mac-udev.sh
-    echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/usr/local/bin/set-unique-mac-udev.sh %k"' | sudo tee /etc/udev/rules.d/99-wlan0-unique-mac.rules > /dev/null
-    sudo udevadm control --reload-rules
-    ok "udev rule installed — MAC set when wlan0 appears."
-
-    # Late MAC fix — udev sets MAC when wlan0 appears; this reapplies if something
-    # overwrote it. Runs 30s after boot to avoid disrupting initial connection.
-    info "Installing set-unique-mac.service (gentle MAC fix 30s after boot)..."
-    sudo tee /usr/local/bin/set-unique-mac.sh > /dev/null << 'SETMAC'
-#!/bin/bash
-IFACE="wlan0"
-[ ! -e "/sys/class/net/${IFACE}" ] && exit 0
-MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
-HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
-[ -z "${HASH}" ] && exit 0
-CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
-CURRENT=$(cat /sys/class/net/${IFACE}/address 2>/dev/null)
-[ "$CURRENT" = "$CLONED_MAC" ] && exit 0
-ip link set "$IFACE" down 2>/dev/null || true
-ip link set "$IFACE" address "$CLONED_MAC" 2>/dev/null || true
-ip link set "$IFACE" up 2>/dev/null || true
-SETMAC
-    sudo chmod +x /usr/local/bin/set-unique-mac.sh
-    sudo tee "${SYSTEMD_DIR}/set-unique-mac.service" > /dev/null << 'EOF'
-[Unit]
-Description=Apply unique MAC to wlan0 (multi-pad IP fix)
-After=network.target wpa_supplicant.service NetworkManager.service
-
-[Service]
-Type=oneshot
-ExecStartPre=/bin/sleep 30
-ExecStart=/usr/local/bin/set-unique-mac.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable set-unique-mac.service
-    ok "set-unique-mac.service enabled (runs 30s after boot)."
-
-    info "Disabling WiFi power save..."
-    if /usr/sbin/iw dev wlan0 get power_save 2>/dev/null | grep -q "off"; then
-        ok "WiFi power save already off."
-    else
-        sudo /usr/sbin/iw dev wlan0 set power_save off 2>/dev/null && ok "WiFi power save disabled." || warn "Could not disable power save via iw (interface may not be up yet — service will handle it at boot)."
-    fi
-
-    # --- Systemd service to keep power save off across reboots ---
-    info "Installing wifi-powersave-off.service..."
-    sudo tee "${SYSTEMD_DIR}/wifi-powersave-off.service" > /dev/null << 'EOF'
-[Unit]
-Description=Disable WiFi Power Save on wlan0
-After=network.target wpa_supplicant.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/iw dev wlan0 set power_save off
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable wifi-powersave-off.service
-    sudo systemctl start wifi-powersave-off.service 2>/dev/null || true
-    ok "wifi-powersave-off.service enabled."
-
-    # --- WiFi Watchdog Script ---
-    info "Installing WiFi watchdog script..."
-    sudo tee /usr/local/bin/wifi-watchdog.sh > /dev/null << 'WATCHDOG'
-#!/bin/bash
-# WiFi Watchdog for SonicPad (XRadio SDIO chip)
-# Only runs recovery when wlan0 has NO IP (actually disconnected).
-# If wlan0 has IP but ping fails (no internet), we do NOT disrupt — avoids
-# the loop where recovery toggles WiFi off/on repeatedly.
-
-INTERFACE="wlan0"
-TEST_HOST="8.8.8.8"
-PING_COUNT=2
-PING_TIMEOUT=5
-LOG="/var/log/wifi-watchdog.log"
-MAX_LOG_LINES=500
-FAIL_COUNT_FILE="/tmp/wifi-watchdog-fails"
-BACKOFF_FILE="/tmp/wifi-watchdog-backoff-until"
-BACKOFF_MINS=15
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
-}
-
-trim_log() {
-    if [ -f "$LOG" ]; then
-        tail -n $MAX_LOG_LINES "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
-    fi
-}
-
-# True if wlan0 has an IPv4 address (is connected to a network)
-has_ip() {
-    ip -4 addr show "$INTERFACE" 2>/dev/null | grep -q "inet "
-}
-
-check_ping() {
-    ping -I "$INTERFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$TEST_HOST" > /dev/null 2>&1
-}
-
-set_unique_mac() {
-    MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
-    HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
-    [ -n "${HASH}" ] && ip link set "$INTERFACE" address "02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}" 2>/dev/null || true
-}
-
-force_station_mode() {
-    ip link set "$INTERFACE" down 2>/dev/null
-    sleep 1
-    iw dev "$INTERFACE" set type station 2>/dev/null || true
-    set_unique_mac
-    ip link set "$INTERFACE" up 2>/dev/null
-    /usr/sbin/iw dev "$INTERFACE" set power_save off 2>/dev/null || true
-}
-
-reload_xradio_module() {
-    log "INFO: Reloading xradio kernel module to force reset..."
-    systemctl stop wpa_supplicant 2>/dev/null || true
-    ip link set "$INTERFACE" down 2>/dev/null || true
-    rmmod xr819_wlan 2>/dev/null || rmmod xradio_wlan 2>/dev/null || rmmod xradio 2>/dev/null || true
-    sleep 3
-    modprobe xr819_wlan 2>/dev/null || modprobe xradio_wlan 2>/dev/null || modprobe xradio 2>/dev/null || true
-    sleep 5
-    force_station_mode
-    sleep 2
-    systemctl start wpa_supplicant 2>/dev/null || true
-    sleep 8
-    dhclient "$INTERFACE" -1 2>/dev/null || true
-}
-
-[ ! -e "/sys/class/net/${INTERFACE}" ] && exit 0
-
-# Backoff: if we failed recovery recently, don't retry for a while
-NOW=$(date +%s 2>/dev/null || echo 0)
-if [ -f "$BACKOFF_FILE" ]; then
-    BACKOFF_UNTIL=$(cat "$BACKOFF_FILE" 2>/dev/null || echo 0)
-    if [ "$NOW" -lt "$BACKOFF_UNTIL" ]; then
-        log "INFO: In backoff period (recovery failed recently), skipping."
-        trim_log
-        exit 0
-    fi
-    rm -f "$BACKOFF_FILE"
-fi
-
-FAILS=0
-[ -f "$FAIL_COUNT_FILE" ] && FAILS=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
-
-if check_ping; then
-    [ "$FAILS" -gt 0 ] && log "OK: Connectivity restored. Resetting fail counter."
-    echo "0" > "$FAIL_COUNT_FILE"
-    trim_log
-    exit 0
-fi
-
-# Ping failed. Only run recovery if wlan0 has NO IP (actually disconnected).
-# If wlan0 has IP but no internet (e.g. local network, captive portal), do NOT disrupt.
-if has_ip; then
-    log "INFO: Ping failed but wlan0 has IP (connected) — skipping recovery to avoid disruption."
-    trim_log
-    exit 0
-fi
-
-FAILS=$((FAILS + 1))
-echo "$FAILS" > "$FAIL_COUNT_FILE"
-log "WARN: No connectivity on $INTERFACE (no IP, consecutive fails: $FAILS). Attempting recovery..."
-
-if [ "$FAILS" -le 3 ]; then
-    force_station_mode
-    sleep 5
-    systemctl is-active --quiet wpa_supplicant 2>/dev/null && systemctl restart wpa_supplicant
-    sleep 8
-    dhclient "$INTERFACE" -1 2>/dev/null || true
-else
-    log "WARN: Soft recovery failed $FAILS times — escalating to module reload."
-    reload_xradio_module
-fi
-
-if check_ping; then
-    log "OK: WiFi recovered successfully (after $FAILS attempts)."
-    echo "0" > "$FAIL_COUNT_FILE"
-else
-    log "ERROR: WiFi recovery failed (attempt $FAILS). Backing off ${BACKOFF_MINS} min."
-    echo $((NOW + BACKOFF_MINS * 60)) > "$BACKOFF_FILE"
-fi
-
-trim_log
-WATCHDOG
-    sudo chmod +x /usr/local/bin/wifi-watchdog.sh
-
-    # --- Watchdog as a systemd timer (every 2 minutes) ---
-    info "Installing wifi-watchdog timer..."
-    sudo tee "${SYSTEMD_DIR}/wifi-watchdog.service" > /dev/null << 'EOF'
-[Unit]
-Description=WiFi Watchdog - Reconnect wlan0 if offline
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/wifi-watchdog.sh
-EOF
-
-    sudo tee "${SYSTEMD_DIR}/wifi-watchdog.timer" > /dev/null << 'EOF'
-[Unit]
-Description=Run WiFi Watchdog every 2 minutes
-
-[Timer]
-OnBootSec=90
-OnUnitActiveSec=2min
-Unit=wifi-watchdog.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable wifi-watchdog.timer
-    sudo systemctl start wifi-watchdog.timer
-    ok "WiFi watchdog timer enabled (runs every 2 minutes)."
-}
-
-# =============================================================================
-# SECTION 3: Accelerometer Support (ADXL345 / Input Shaper)
+# SECTION 2: Accelerometer Support (ADXL345 / Input Shaper)
 # =============================================================================
 setup_accelerometer() {
     banner "Accelerometer / Input Shaper Support"
@@ -879,7 +497,7 @@ EOF
 }
 
 # =============================================================================
-# SECTION 4: KIAUH Installation
+# SECTION 3: KIAUH Installation
 # =============================================================================
 setup_kiauh() {
     banner "KIAUH Installation"
@@ -903,7 +521,7 @@ setup_kiauh() {
 }
 
 # =============================================================================
-# SECTION 5: System / OS Performance Tuning
+# SECTION 4: System / OS Performance Tuning
 # =============================================================================
 setup_os_tuning() {
     banner "System / OS Performance Tuning"
@@ -1087,7 +705,7 @@ EOF
 }
 
 # =============================================================================
-# SECTION 6: Log Rotation
+# SECTION 5: Log Rotation
 # =============================================================================
 setup_logrotate() {
     banner "Log Rotation Setup"
@@ -1148,21 +766,6 @@ EOF
 EOF
     ok "Crowsnest logrotate configured."
 
-    # --- WiFi watchdog log ---
-    info "Writing logrotate config for wifi-watchdog..."
-    sudo tee /etc/logrotate.d/wifi-watchdog > /dev/null << 'EOF'
-/var/log/wifi-watchdog.log {
-    weekly
-    rotate 4
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-    ok "WiFi watchdog logrotate configured."
-
     # --- System journal size cap ---
     # journald can grow unbounded on a R/W filesystem — cap it at 64MB.
     info "Capping systemd journal size to 64MB..."
@@ -1193,15 +796,13 @@ main() {
     echo ""
     echo "  This script will configure:"
     echo "  [1] Creality Nebula Camera (YUYV/CPU via crowsnest)"
-    echo "  [2] WiFi Power Save OFF + Auto-Reconnect Watchdog"
-    echo "  [3] Accelerometer / Input Shaper packages (ADXL345)"
-    echo "  [4] KIAUH (Klipper Installation & Update Helper)"
-    echo "  [5] System / OS Performance Tuning"
+    echo "  [2] Accelerometer / Input Shaper packages (ADXL345)"
+    echo "  [3] KIAUH (Klipper Installation & Update Helper)"
+    echo "  [4] System / OS Performance Tuning"
     echo "       vm.swappiness, CPU governor, tmpfs, noatime, Klipper priority,"
     echo "       disable unused services"
-    echo "  [6] Log Rotation (Klipper, Moonraker, Crowsnest, journal cap)"
+    echo "  [5] Log Rotation (Klipper, Moonraker, Crowsnest, journal cap)"
     echo ""
-    [ "$SKIP_WIFI" = true ] && echo -e "  ${YELLOW}[SAFE MODE] WiFi/MAC changes will be skipped.${NC}" && echo ""
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
     require_sudo
@@ -1211,7 +812,6 @@ main() {
     setup_hostname
 
     setup_nebula_camera
-    setup_wifi
     setup_accelerometer
     setup_kiauh
     setup_os_tuning
@@ -1221,27 +821,19 @@ main() {
     echo -e "${GREEN}All steps finished. Summary:${NC}"
     echo ""
     echo "  Camera   → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU, 1280x720)"
-    if [ "$SKIP_WIFI" = true ]; then
-        echo "  WiFi     → SKIPPED (safe mode). Re-run without --skip-wifi to enable."
-    else
-        echo "  WiFi     → Unique MAC per device (fixes multi-pad IP conflicts), power save"
-        echo "             disabled, watchdog timer active (2 min interval)"
-    fi
     echo "  Accel    → ARM toolchain + Python packages installed, sample config written"
     echo "  KIAUH    → Ready at ~/kiauh/kiauh.sh"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
-    echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest, watchdog"
+    echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
     echo "             systemd journal capped at 64MB"
     echo ""
     echo -e "${YELLOW}Next steps:${NC}"
-    echo "  1. If you have multiple SonicPads: run this script on EACH pad (each gets a"
-    echo "     unique MAC from its machine-id, so they'll receive different IPs)."
-    echo "  2. Launch KIAUH to install Klipper, Moonraker, Mainsail, Crowsnest"
+    echo "  1. Launch KIAUH to install Klipper, Moonraker, Mainsail, Crowsnest"
     echo "     (use the option below to launch with TMPDIR fix for OctoEverywhere)"
-    echo "  3. After Klipper is installed, re-run this script to complete host MCU setup"
-    echo "  4. Review ~/printer_data/config/adxl345_sample.cfg and merge into printer.cfg"
-    echo "  5. Reboot:  sudo reboot (required for unique MAC to take effect)"
+    echo "  2. After Klipper is installed, re-run this script to complete host MCU setup"
+    echo "  3. Review ~/printer_data/config/adxl345_sample.cfg and merge into printer.cfg"
+    echo "  4. Reboot:  sudo reboot"
     echo ""
     echo -e "${YELLOW}TIP:${NC} When installing OctoEverywhere via KIAUH Extensions,"
     echo "     launch KIAUH with TMPDIR set to avoid 'No space left on device' errors."
