@@ -15,7 +15,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.3.6"
+SCRIPT_VERSION="1.3.7"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -491,7 +491,7 @@ WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload
     sudo systemctl enable set-unique-mac.service
-    ok "set-unique-mac.service enabled (runs 10s after boot)."
+    ok "set-unique-mac.service enabled (runs 30s after boot)."
 
     info "Disabling WiFi power save..."
     if /usr/sbin/iw dev wlan0 get power_save 2>/dev/null | grep -q "off"; then
@@ -525,17 +525,19 @@ EOF
     sudo tee /usr/local/bin/wifi-watchdog.sh > /dev/null << 'WATCHDOG'
 #!/bin/bash
 # WiFi Watchdog for SonicPad (XRadio SDIO chip)
-# Detects loss of network connectivity and recovers wlan0
-# Uses escalating recovery: soft bounce -> station mode force -> module reload
+# Only runs recovery when wlan0 has NO IP (actually disconnected).
+# If wlan0 has IP but ping fails (no internet), we do NOT disrupt — avoids
+# the loop where recovery toggles WiFi off/on repeatedly.
 
 INTERFACE="wlan0"
 TEST_HOST="8.8.8.8"
-PING_COUNT=3
+PING_COUNT=2
 PING_TIMEOUT=5
 LOG="/var/log/wifi-watchdog.log"
 MAX_LOG_LINES=500
 FAIL_COUNT_FILE="/tmp/wifi-watchdog-fails"
-MAC_CORRECTED_FILE="/tmp/wifi-watchdog-mac-corrected"
+BACKOFF_FILE="/tmp/wifi-watchdog-backoff-until"
+BACKOFF_MINS=15
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
@@ -547,17 +549,19 @@ trim_log() {
     fi
 }
 
+# True if wlan0 has an IPv4 address (is connected to a network)
+has_ip() {
+    ip -4 addr show "$INTERFACE" 2>/dev/null | grep -q "inet "
+}
+
 check_ping() {
     ping -I "$INTERFACE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$TEST_HOST" > /dev/null 2>&1
 }
 
 set_unique_mac() {
-    MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback-$(hostname)-$(date +%s)")
+    MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo "fallback")
     HASH=$(echo -n "${MACHINE_ID}" | md5sum 2>/dev/null | cut -c1-10)
-    if [ -n "${HASH}" ]; then
-        CLONED_MAC="02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}"
-        ip link set "$INTERFACE" address "$CLONED_MAC" 2>/dev/null || true
-    fi
+    [ -n "${HASH}" ] && ip link set "$INTERFACE" address "02:${HASH:0:2}:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}" 2>/dev/null || true
 }
 
 force_station_mode() {
@@ -570,9 +574,6 @@ force_station_mode() {
 }
 
 reload_xradio_module() {
-    # Nuclear option — unload and reload the XRadio kernel module.
-    # This fully resets the chip out of P2P mode when soft methods fail.
-    # Module name varies by SonicPad kernel: xr819_wlan or xradio_wlan
     log "INFO: Reloading xradio kernel module to force reset..."
     systemctl stop wpa_supplicant 2>/dev/null || true
     ip link set "$INTERFACE" down 2>/dev/null || true
@@ -587,53 +588,59 @@ reload_xradio_module() {
     dhclient "$INTERFACE" -1 2>/dev/null || true
 }
 
-rm -f "$MAC_CORRECTED_FILE" 2>/dev/null || true
+[ ! -e "/sys/class/net/${INTERFACE}" ] && exit 0
 
-# Read consecutive fail count
-FAILS=0
-if [ -f "$FAIL_COUNT_FILE" ]; then
-    FAILS=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
+# Backoff: if we failed recovery recently, don't retry for a while
+NOW=$(date +%s 2>/dev/null || echo 0)
+if [ -f "$BACKOFF_FILE" ]; then
+    BACKOFF_UNTIL=$(cat "$BACKOFF_FILE" 2>/dev/null || echo 0)
+    if [ "$NOW" -lt "$BACKOFF_UNTIL" ]; then
+        log "INFO: In backoff period (recovery failed recently), skipping."
+        trim_log
+        exit 0
+    fi
+    rm -f "$BACKOFF_FILE"
 fi
 
-if ! check_ping; then
-    FAILS=$((FAILS + 1))
-    echo "$FAILS" > "$FAIL_COUNT_FILE"
-    log "WARN: No connectivity on $INTERFACE (consecutive fails: $FAILS). Attempting recovery..."
+FAILS=0
+[ -f "$FAIL_COUNT_FILE" ] && FAILS=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
 
-    # Skip force_station_mode if we just corrected MAC — it uses ip link set address
-    # which doesn't work on XRadio and would reset MAC back to hardware.
-    if [ -f "$MAC_CORRECTED_FILE" ]; then
-        log "INFO: Skipping recovery (MAC was just corrected, waiting for reconnect)"
-        rm -f "$MAC_CORRECTED_FILE" 2>/dev/null || true
-    elif [ "$FAILS" -le 3 ]; then
-        # Soft recovery: force station mode and restart wpa_supplicant
-        force_station_mode
-        sleep 5
-        if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
-            systemctl restart wpa_supplicant
-            sleep 8
-        fi
-        dhclient "$INTERFACE" -1 2>/dev/null || true
+if check_ping; then
+    [ "$FAILS" -gt 0 ] && log "OK: Connectivity restored. Resetting fail counter."
+    echo "0" > "$FAIL_COUNT_FILE"
+    trim_log
+    exit 0
+fi
 
-    else
-        # Hard recovery: reload the XRadio module entirely
-        log "WARN: Soft recovery failed $FAILS times — escalating to module reload."
-        reload_xradio_module
-    fi
+# Ping failed. Only run recovery if wlan0 has NO IP (actually disconnected).
+# If wlan0 has IP but no internet (e.g. local network, captive portal), do NOT disrupt.
+if has_ip; then
+    log "INFO: Ping failed but wlan0 has IP (connected) — skipping recovery to avoid disruption."
+    trim_log
+    exit 0
+fi
 
-    # Final check
-    if check_ping; then
-        log "OK: WiFi recovered successfully (after $FAILS attempts)."
-        echo "0" > "$FAIL_COUNT_FILE"
-    else
-        log "ERROR: WiFi recovery failed (attempt $FAILS)."
-    fi
+FAILS=$((FAILS + 1))
+echo "$FAILS" > "$FAIL_COUNT_FILE"
+log "WARN: No connectivity on $INTERFACE (no IP, consecutive fails: $FAILS). Attempting recovery..."
+
+if [ "$FAILS" -le 3 ]; then
+    force_station_mode
+    sleep 5
+    systemctl is-active --quiet wpa_supplicant 2>/dev/null && systemctl restart wpa_supplicant
+    sleep 8
+    dhclient "$INTERFACE" -1 2>/dev/null || true
 else
-    # Connectivity OK — reset fail counter
-    if [ "$FAILS" -gt 0 ]; then
-        log "OK: Connectivity restored. Resetting fail counter."
-        echo "0" > "$FAIL_COUNT_FILE"
-    fi
+    log "WARN: Soft recovery failed $FAILS times — escalating to module reload."
+    reload_xradio_module
+fi
+
+if check_ping; then
+    log "OK: WiFi recovered successfully (after $FAILS attempts)."
+    echo "0" > "$FAIL_COUNT_FILE"
+else
+    log "ERROR: WiFi recovery failed (attempt $FAILS). Backing off ${BACKOFF_MINS} min."
+    echo $((NOW + BACKOFF_MINS * 60)) > "$BACKOFF_FILE"
 fi
 
 trim_log

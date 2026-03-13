@@ -219,6 +219,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 
 ## Changelog
 
+### v1.3.7
+- Fixed: WiFi watchdog no longer disrupts when wlan0 has IP but ping fails (e.g. no internet, local network). Only runs recovery when wlan0 has no IP (actually disconnected). Added 15-min backoff after failed recovery to stop the on/off loop.
+
 ### v1.3.6
 - Fixed: WiFi now works out of the box. Removed aggressive boot-time WiFi changes (xradio-station-mode.service, fix-mac-at-boot.timer, cron @reboot) that stopped wpa_supplicant and reloaded the driver repeatedly — WiFi never had a chance to connect. Now uses only: udev (set MAC when wlan0 appears), set-unique-mac.service (gentle ip link down/address/up at 30s), power save off, watchdog for recovery. xradio-station-mode.sh kept for watchdog hard recovery when already offline.
 
