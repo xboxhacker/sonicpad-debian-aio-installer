@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.2"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -628,6 +628,36 @@ setup_kiauh() {
 }
 
 # =============================================================================
+# SECTION 3.1: KlipperScreen Update (if installed)
+# =============================================================================
+update_klipperscreen() {
+    local ks_dir="/home/sonic/KlipperScreen"
+
+    if [ ! -d "${ks_dir}" ]; then
+        info "KlipperScreen not found at ${ks_dir}. Skipping update."
+        return 0
+    fi
+    if [ ! -d "${ks_dir}/.git" ]; then
+        warn "KlipperScreen exists but is not a git checkout. Skipping auto-update."
+        return 0
+    fi
+
+    info "Updating KlipperScreen (git pull --ff-only)..."
+
+    # Do not auto-pull if user has local modifications in KlipperScreen repo.
+    if ! git -C "${ks_dir}" diff --quiet 2>/dev/null || ! git -C "${ks_dir}" diff --cached --quiet 2>/dev/null; then
+        warn "KlipperScreen has local changes. Skipping update to avoid overwriting edits."
+        return 0
+    fi
+
+    if git -C "${ks_dir}" pull --ff-only 2>/dev/null; then
+        ok "KlipperScreen updated."
+    else
+        warn "KlipperScreen update failed (non-fast-forward/network issue). Continuing."
+    fi
+}
+
+# =============================================================================
 # FIX: WiFi stability (power save off, MAC preservation, prevent dropouts)
 # =============================================================================
 # Logs showed: 4-way handshake -> disconnected, "no secrets", MAC randomization.
@@ -753,6 +783,59 @@ fix_klipperscreen_config() {
     if [ "${fixed}" = true ]; then
         info "Fixing KlipperScreen screen_blanking (removing inline comments)..."
         ok "KlipperScreen config fixed."
+        if systemctl is-active --quiet KlipperScreen 2>/dev/null; then
+            sudo systemctl restart KlipperScreen 2>/dev/null && ok "KlipperScreen restarted." || true
+        fi
+    fi
+}
+
+# =============================================================================
+# FIX: KlipperScreen WiFi P2P UI handling after updates
+# =============================================================================
+# Newer KlipperScreen builds may list p2p0 first and show misleading IP labels
+# like "(p2p0)" even when wlan0 is connected. Patch runtime files idempotently.
+fix_klipperscreen_wifi_p2p_ui() {
+    local panel_py="/home/sonic/KlipperScreen/panels/network.py"
+    local sdbus_py="/home/sonic/KlipperScreen/ks_includes/sdbus_nm.py"
+    local changed=false
+
+    # Patch panels/network.py: filter out p2p* interfaces from wireless list
+    if [ -f "${panel_py}" ]; then
+        if grep -q 'self.wireless_interfaces = \[iface.interface for iface in self.sdbus_nm.get_wireless_interfaces()\]' "${panel_py}" 2>/dev/null; then
+            info "Patching KlipperScreen network panel to ignore p2p interfaces..."
+            sed -i 's|self.wireless_interfaces = \[iface.interface for iface in self.sdbus_nm.get_wireless_interfaces()\]|self.wireless_interfaces = [iface.interface for iface in self.sdbus_nm.get_wireless_interfaces() if not iface.interface.startswith("p2p")]|' "${panel_py}"
+            changed=true
+            ok "Patched network.py (p2p filtered)."
+        fi
+    fi
+
+    # Patch ks_includes/sdbus_nm.py:
+    # 1) Ignore unmanaged popup for p2p interfaces
+    # 2) Show actual active iface in IP label instead of selected wlan_device iface
+    if [ -f "${sdbus_py}" ]; then
+        if grep -q 'self.popup(f"{self.wlan_device.interface} is not managed by NetworkManager and cannot be controlled by this app")' "${sdbus_py}" 2>/dev/null; then
+            info "Patching KlipperScreen unmanaged p2p popup handling..."
+            sed -i 's|self.popup(f"{self.wlan_device.interface} is not managed by NetworkManager and cannot be controlled by this app")|if str(self.wlan_device.interface).startswith("p2p"):\n                logging.info(f"Ignoring unmanaged P2P interface: {self.wlan_device.interface}")\n            else:\n                self.popup(f"{self.wlan_device.interface} is not managed by NetworkManager and cannot be controlled by this app")|' "${sdbus_py}"
+            changed=true
+            ok "Patched sdbus_nm.py (ignore unmanaged p2p popup)."
+        fi
+
+        if grep -q 'return f"{ip} ({self.wlan_device.interface})"' "${sdbus_py}" 2>/dev/null; then
+            info "Patching KlipperScreen IP label to show active interface..."
+            sed -i 's|return f"{ip} ({self.wlan_device.interface})"|return f"{ip} ({iface_name})"|' "${sdbus_py}"
+            changed=true
+            ok "Patched sdbus_nm.py (IP label uses active iface)."
+        fi
+    fi
+
+    # Syntax check and restart only when we changed something
+    if [ "${changed}" = true ]; then
+        if [ -f "${panel_py}" ]; then
+            python3 -m py_compile "${panel_py}" 2>/dev/null || warn "network.py syntax check failed."
+        fi
+        if [ -f "${sdbus_py}" ]; then
+            python3 -m py_compile "${sdbus_py}" 2>/dev/null || warn "sdbus_nm.py syntax check failed."
+        fi
         if systemctl is-active --quiet KlipperScreen 2>/dev/null; then
             sudo systemctl restart KlipperScreen 2>/dev/null && ok "KlipperScreen restarted." || true
         fi
@@ -1058,12 +1141,14 @@ main() {
     setup_nebula_camera
     setup_accelerometer
     setup_kiauh
+    update_klipperscreen
     setup_os_tuning
     setup_logrotate
     fix_wifi_stability
     fix_wifi_p2p
     fix_moonraker_biqu_path
     fix_klipperscreen_config
+    fix_klipperscreen_wifi_p2p_ui
     fix_sonic_path_env
 
     banner "Setup Complete!"
@@ -1072,10 +1157,11 @@ main() {
     echo "  Camera   → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU, 1280x720)"
     echo "  Accel    → ARM toolchain + Python packages, optional host MCU build (Linux process)"
     echo "  KIAUH    → Ready at ~/kiauh/kiauh.sh"
+    echo "  KScreen  → Auto-updated from ~/KlipperScreen when clean git checkout"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
     echo "  WiFi     → Power save off, MAC preserved, p2p0 disabled"
-    echo "  Fixes    → KlipperScreen screen_blanking, moonraker biqu→sonic path"
+    echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
     echo "             systemd journal capped at 64MB"
     echo ""
