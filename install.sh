@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -82,6 +82,84 @@ setup_hostname() {
         fi
         ok "Hostname set to '${NEW_HOSTNAME}'."
         info "Pad will be reachable at ${NEW_HOSTNAME}.local after reboot."
+    fi
+}
+
+# =============================================================================
+# STATIC IP SETUP (optional)
+# =============================================================================
+setup_static_ip() {
+    banner "Static IP Configuration (Optional)"
+    echo "  Configure a static IP for Ethernet or WiFi (instead of DHCP)."
+    echo ""
+    if [ ! -t 0 ]; then
+        info "Non-interactive mode: skipping static IP. Run 'sudo nmtui' to configure manually."
+        return 0
+    fi
+    read -p "  Configure static IP now? [y/N]: " DO_STATIC
+    case "${DO_STATIC}" in
+        [Yy]*) ;;
+        *) info "Skipping static IP. Using DHCP."; return 0 ;;
+    esac
+
+    echo ""
+    echo "  Which interface?"
+    echo "    1) Ethernet (eth0)"
+    echo "    2) WiFi (wlan0)"
+    echo ""
+    read -p "  Select [1/2]: " IFACE_CHOICE
+
+    case "${IFACE_CHOICE}" in
+        1) DEVICE="eth0" ;;
+        2) DEVICE="wlan0" ;;
+        *) warn "Invalid choice. Skipping static IP."; return 0 ;;
+    esac
+
+    # Find the connection name for this device
+    CONN=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":${DEVICE}$" | cut -d: -f1 | head -1)
+    if [ -z "${CONN}" ]; then
+        CONN=$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null | grep ":${DEVICE}$" | cut -d: -f1 | head -1)
+    fi
+    if [ -z "${CONN}" ]; then
+        warn "No NetworkManager connection found for ${DEVICE}. Configure manually with: sudo nmtui"
+        return 0
+    fi
+
+    echo ""
+    echo "  Using connection: ${CONN}"
+    echo "  Example: IP 192.168.1.100, Gateway 192.168.1.1, DNS 8.8.8.8"
+    echo ""
+    read -p "  IP address (e.g. 192.168.1.100): " STATIC_IP
+    read -p "  CIDR prefix (e.g. 24 for /24): " STATIC_CIDR
+    read -p "  Gateway (e.g. 192.168.1.1): " STATIC_GW
+    read -p "  DNS server (e.g. 8.8.8.8): " STATIC_DNS
+
+    STATIC_IP=$(echo "${STATIC_IP}" | tr -d '[:space:]')
+    STATIC_CIDR=$(echo "${STATIC_CIDR}" | tr -d '[:space:]')
+    STATIC_GW=$(echo "${STATIC_GW}" | tr -d '[:space:]')
+    STATIC_DNS=$(echo "${STATIC_DNS}" | tr -d '[:space:]')
+
+    if [ -z "${STATIC_IP}" ] || [ -z "${STATIC_CIDR}" ]; then
+        warn "IP and CIDR required. Skipping."
+        return 0
+    fi
+
+    info "Applying static IP to ${CONN}..."
+    sudo nmcli connection modify "${CONN}" ipv4.method manual
+    sudo nmcli connection modify "${CONN}" ipv4.addresses "${STATIC_IP}/${STATIC_CIDR}"
+    [ -n "${STATIC_GW}" ] && sudo nmcli connection modify "${CONN}" ipv4.gateway "${STATIC_GW}"
+    [ -n "${STATIC_DNS}" ] && sudo nmcli connection modify "${CONN}" ipv4.dns "${STATIC_DNS}"
+
+    info "Reconnecting ${DEVICE}..."
+    sudo nmcli connection down "${CONN}" 2>/dev/null || true
+    sleep 2
+    sudo nmcli connection up "${CONN}" 2>/dev/null || true
+    sleep 2
+
+    if ip -4 addr show "${DEVICE}" 2>/dev/null | grep -q "inet "; then
+        ok "Static IP configured. ${DEVICE} should have ${STATIC_IP}/${STATIC_CIDR}"
+    else
+        warn "Connection may need manual check. Run: ip addr show ${DEVICE}"
     fi
 }
 
@@ -802,6 +880,7 @@ main() {
     echo "       vm.swappiness, CPU governor, tmpfs, noatime, Klipper priority,"
     echo "       disable unused services"
     echo "  [5] Log Rotation (Klipper, Moonraker, Crowsnest, journal cap)"
+    echo "  [*] Static IP (optional, prompted after hostname)"
     echo ""
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
@@ -810,6 +889,7 @@ main() {
     stop_klipper_services
     preflight_check
     setup_hostname
+    setup_static_ip
 
     setup_nebula_camera
     setup_accelerometer

@@ -15,6 +15,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
+| 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager |
 
 ---
 
@@ -201,6 +202,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.4.1
+- Added: Optional static IP configuration. Script prompts after hostname setup to configure static IP for Ethernet or WiFi via NetworkManager.
 
 ### v1.4.0
 - Removed: All WiFi-related setup (unique MAC, power save, watchdog, udev, NetworkManager configs). Configure WiFi manually via nmtui, KlipperScreen, or wpa_supplicant. Hostname setup retained.
