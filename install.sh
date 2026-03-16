@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.5.0"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -115,10 +115,16 @@ setup_static_ip() {
         *) warn "Invalid choice. Skipping static IP."; return 0 ;;
     esac
 
-    # Find the connection name for this device
-    CONN=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":${DEVICE}$" | cut -d: -f1 | head -1)
+    # Find the connection name for this device.
+    # For wlan0: prefer 802-11-wireless (infrastructure) over wifi-p2p to avoid P2P mode.
+    if [ "${DEVICE}" = "wlan0" ]; then
+        CONN=$(nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null | awk -F: -v d="${DEVICE}" '$2==d && $3=="802-11-wireless" {print $1; exit}')
+        [ -z "${CONN}" ] && CONN=$(nmcli -t -f NAME,DEVICE,TYPE connection show 2>/dev/null | awk -F: -v d="${DEVICE}" '$2==d && $3=="802-11-wireless" {print $1; exit}')
+        [ -z "${CONN}" ] && CONN=$(nmcli -t -f NAME,DEVICE,TYPE connection show 2>/dev/null | awk -F: -v d="${DEVICE}" '$2==d && $3!="wifi-p2p" {print $1; exit}')
+    fi
     if [ -z "${CONN}" ]; then
-        CONN=$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null | grep ":${DEVICE}$" | cut -d: -f1 | head -1)
+        CONN=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":${DEVICE}$" | cut -d: -f1 | head -1)
+        [ -z "${CONN}" ] && CONN=$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null | grep ":${DEVICE}$" | cut -d: -f1 | head -1)
     fi
     if [ -z "${CONN}" ]; then
         warn "No NetworkManager connection found for ${DEVICE}. Configure manually with: sudo nmtui"
@@ -145,6 +151,8 @@ setup_static_ip() {
     fi
 
     info "Applying static IP to ${CONN}..."
+    # Bind WiFi connection to wlan0 (avoids p2p / WiFi Direct mode)
+    [ "${DEVICE}" = "wlan0" ] && sudo nmcli connection modify "${CONN}" connection.interface-name wlan0
     sudo nmcli connection modify "${CONN}" ipv4.method manual
     sudo nmcli connection modify "${CONN}" ipv4.addresses "${STATIC_IP}/${STATIC_CIDR}"
     [ -n "${STATIC_GW}" ] && sudo nmcli connection modify "${CONN}" ipv4.gateway "${STATIC_GW}"
@@ -514,23 +522,44 @@ EOF
         ok "klipper-mcu.service installed and enabled."
 
         # Build and flash the host MCU.
-        # 'make' compiles using the existing .config (Linux process MCU).
-        # 'sudo make flash' copies the binary to /usr/local/bin/klipper-mcu.
+        # Must use Linux process MCU config (not AVR/STM32/etc). We write a minimal
+        # .config and run olddefconfig to fill defaults, then build.
+        # 'sudo make flash' copies the binary to /usr/local/bin/klipper_mcu.
         # No bootloader, no serial port — just a file copy.
-        info "Building Klipper host MCU firmware..."
-        cd "${KLIPPER_DIR}"
-        make clean 2>/dev/null || true
-        if make 2>/dev/null; then
-            ok "Host MCU firmware built."
-            if sudo make flash 2>/dev/null; then
-                ok "Host MCU flashed to /usr/local/bin/klipper-mcu."
-            else
-                warn "make flash failed. Run manually: cd ~/klipper && make && sudo make flash"
-            fi
-        else
-            warn "Host MCU build failed. Run manually: cd ~/klipper && make && sudo make flash"
-        fi
-        cd - > /dev/null
+        echo ""
+        read -p "  Build and flash Klipper host MCU firmware? [Y/n]: " DO_BUILD_FW
+        DO_BUILD_FW="${DO_BUILD_FW:-Y}"
+        case "${DO_BUILD_FW}" in
+            [Yy]*)
+                info "Building Klipper host MCU firmware (Linux process)..."
+                cd "${KLIPPER_DIR}"
+                # Backup existing .config (user may have printer MCU config)
+                [ -f .config ] && cp .config .config.bak.printer
+                # Force Linux process MCU config
+                echo 'CONFIG_MACH_LINUX=y' > .config
+                make olddefconfig 2>/dev/null || true
+                make clean 2>/dev/null || true
+                if make 2>/dev/null; then
+                    ok "Host MCU firmware built."
+                    if sudo make flash 2>/dev/null; then
+                        ok "Host MCU flashed to /usr/local/bin/klipper_mcu."
+                    else
+                        warn "make flash failed. Run manually: cd ~/klipper && make && sudo make flash"
+                    fi
+                else
+                    warn "Host MCU build failed. Run manually: cd ~/klipper && make menuconfig (select Linux process) && make && sudo make flash"
+                fi
+                # Restore printer config so user can build printer firmware later
+                if [ -f .config.bak.printer ]; then
+                    mv .config.bak.printer .config
+                    ok "Restored printer MCU config."
+                fi
+                cd - > /dev/null
+                ;;
+            *)
+                info "Skipping host MCU build. Run manually when ready: cd ~/klipper && make menuconfig (select Linux process) && make && sudo make flash"
+                ;;
+        esac
 
         # Fix spidev permissions — /dev/spidev2.0 is root-only by default,
         # which prevents the sonic user from accessing the ADXL345.
@@ -596,6 +625,138 @@ setup_kiauh() {
     ok "KIAUH is ready. Launch with:  ~/kiauh/kiauh.sh"
     info "KIAUH will NOT be launched automatically — run it after this script completes."
     info "Use KIAUH to install/update: Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, Crowsnest."
+}
+
+# =============================================================================
+# FIX: WiFi stability (power save off, MAC preservation, prevent dropouts)
+# =============================================================================
+# Logs showed: 4-way handshake -> disconnected, "no secrets", MAC randomization.
+# Fixes: power save off, use real MAC (no randomization), apply to existing conns.
+fix_wifi_stability() {
+    # Disable WiFi power management + MAC randomization (major causes of dropouts)
+    local nm_powersave="/etc/NetworkManager/conf.d/95-wifi-powersave-off.conf"
+    info "Configuring WiFi stability (power save off, MAC preservation)..."
+    sudo mkdir -p /etc/NetworkManager/conf.d
+    sudo tee "${nm_powersave}" > /dev/null << 'EOF'
+# Disable WiFi power management — prevents connection dropouts
+# Use real MAC address — MAC randomization causes 4-way handshake failures on some routers
+[connection]
+wifi.powersave = 2
+wifi.cloned-mac-address = preserve
+wifi.scan-rand-mac-address = no
+EOF
+    ok "WiFi power save and MAC preservation configured."
+    sudo systemctl reload NetworkManager 2>/dev/null || true
+    # Apply MAC preservation to existing WiFi connections (global default may not apply)
+    for conn in $(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1}'); do
+        nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address preserve 2>/dev/null && info "  Set preserve MAC for: ${conn}" || true
+    done
+    # iwconfig power off at boot — some drivers need this in addition to NM
+    if [ -f /etc/rc.local ] && ! grep -q "iwconfig.*power" /etc/rc.local 2>/dev/null; then
+        info "Adding iwconfig power off to rc.local..."
+        sudo sed -i '/^exit 0/d' /etc/rc.local 2>/dev/null || true
+        cat << 'EOF' | sudo tee -a /etc/rc.local > /dev/null
+
+# Disable WiFi power save (prevents dropouts)
+iwconfig wlan0 power off 2>/dev/null || true
+exit 0
+EOF
+        ok "iwconfig power off added to rc.local."
+    fi
+}
+
+# =============================================================================
+# FIX: Permanently disable WiFi P2P (p2p0) so KlipperScreen uses wlan0
+# =============================================================================
+# NetworkManager creates p2p0 when WiFi P2P is enabled. KlipperScreen may show
+# p2p0 instead of wlan0. Unmanage + udev down + p2p_disabled in wpa_supplicant.
+fix_wifi_p2p() {
+    # NetworkManager: ignore p2p devices so they don't appear in network panel
+    local nm_conf="/etc/NetworkManager/conf.d/99-p2p-unmanaged.conf"
+    if [ ! -f "${nm_conf}" ]; then
+        info "Disabling WiFi P2P (p2p0) so wlan0 is used..."
+        sudo mkdir -p /etc/NetworkManager/conf.d
+        sudo tee "${nm_conf}" > /dev/null << 'EOF'
+# Prevent p2p0 from being managed — KlipperScreen will use wlan0 instead
+[keyfile]
+unmanaged-devices=interface-name:p2p0;interface-name:p2p-dev-wlan0;interface-name:p2p-wlan0-*
+EOF
+        ok "NetworkManager will ignore p2p devices."
+        sudo systemctl reload NetworkManager 2>/dev/null || true
+    fi
+    # udev: bring p2p0 down when it appears (permanently disable interface)
+    local udev_rule="/etc/udev/rules.d/99-disable-p2p0.rules"
+    if [ ! -f "${udev_rule}" ]; then
+        info "Adding udev rule to disable p2p0..."
+        echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="p2p0", RUN+="/sbin/ip link set p2p0 down"' | sudo tee "${udev_rule}" > /dev/null
+        sudo udevadm control --reload-rules
+        ok "udev rule added: p2p0 will be brought down when created."
+    fi
+    # wpa_supplicant: disable P2P at source (prevents p2p0 creation)
+    local wpas_conf="/etc/wpa_supplicant/wpa_supplicant.conf"
+    if [ -f "${wpas_conf}" ] && ! grep -q "p2p_disabled" "${wpas_conf}" 2>/dev/null; then
+        echo "p2p_disabled=1" | sudo tee -a "${wpas_conf}" > /dev/null
+        ok "Added p2p_disabled=1 to wpa_supplicant."
+    fi
+    # Bring down p2p0 now if it exists
+    sudo ip link set p2p0 down 2>/dev/null && info "  p2p0 brought down." || true
+}
+
+# =============================================================================
+# FIX: Moonraker klippy_uds_address (biqu -> sonic path)
+# =============================================================================
+# Some configs reference /home/biqu/ (Biqu pad) but SonicPad uses /home/sonic/.
+fix_moonraker_biqu_path() {
+    local conf="/home/sonic/printer_data/config/moonraker.conf"
+    [ -f "${conf}" ] || return 0
+    if grep -q "/home/biqu/" "${conf}" 2>/dev/null; then
+        info "Fixing moonraker.conf: biqu -> sonic path..."
+        sudo sed -i 's|/home/biqu/|/home/sonic/|g' "${conf}"
+        ok "moonraker.conf path corrected."
+        if systemctl is-active --quiet moonraker 2>/dev/null; then
+            sudo systemctl restart moonraker 2>/dev/null && ok "Moonraker restarted." || true
+        fi
+    fi
+}
+
+# =============================================================================
+# FIX: Add /usr/sbin to PATH for sonic user (rfkill, etc.)
+# =============================================================================
+fix_sonic_path_env() {
+    local bashrc="/home/sonic/.bashrc"
+    [ -f "${bashrc}" ] || return 0
+    if ! grep -q 'PATH=.*/usr/sbin' "${bashrc}" 2>/dev/null; then
+        echo 'export PATH="$PATH:/usr/sbin"' >> "${bashrc}"
+        ok "Added /usr/sbin to PATH in .bashrc."
+    fi
+}
+
+# =============================================================================
+# FIX: KlipperScreen screen_blanking config
+# =============================================================================
+# KlipperScreen crashes if screen_blanking has an inline comment (e.g. "600  #Blank af mins").
+# Fix both [main] section and Moonraker's #~# managed section.
+fix_klipperscreen_config() {
+    local conf="/home/sonic/printer_data/config/KlipperScreen.conf"
+    [ -f "${conf}" ] || return 0
+    local fixed=false
+    # Fix [main] section: screen_blanking: 600  #comment -> screen_blanking: 600
+    if grep -q "screen_blanking:.*#" "${conf}" 2>/dev/null; then
+        sed -i 's/^\(screen_blanking:\s*\)\([0-9][0-9]*\).*/\1\2/' "${conf}"
+        fixed=true
+    fi
+    # Fix #~# managed section: screen_blanking = 600  #comment -> screen_blanking = 600
+    if grep -q "#~# screen_blanking.*#" "${conf}" 2>/dev/null; then
+        sed -i 's/\(#~# screen_blanking = [0-9][0-9]*\).*/\1/' "${conf}"
+        fixed=true
+    fi
+    if [ "${fixed}" = true ]; then
+        info "Fixing KlipperScreen screen_blanking (removing inline comments)..."
+        ok "KlipperScreen config fixed."
+        if systemctl is-active --quiet KlipperScreen 2>/dev/null; then
+            sudo systemctl restart KlipperScreen 2>/dev/null && ok "KlipperScreen restarted." || true
+        fi
+    fi
 }
 
 # =============================================================================
@@ -885,6 +1046,9 @@ main() {
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
     require_sudo
+    info "Updating package lists and installing usbutils, python3-serial, rfkill..."
+    sudo apt update
+    sudo apt install -y usbutils python3-serial rfkill
     fix_ssl
     stop_klipper_services
     preflight_check
@@ -896,15 +1060,22 @@ main() {
     setup_kiauh
     setup_os_tuning
     setup_logrotate
+    fix_wifi_stability
+    fix_wifi_p2p
+    fix_moonraker_biqu_path
+    fix_klipperscreen_config
+    fix_sonic_path_env
 
     banner "Setup Complete!"
     echo -e "${GREEN}All steps finished. Summary:${NC}"
     echo ""
     echo "  Camera   → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU, 1280x720)"
-    echo "  Accel    → ARM toolchain + Python packages installed, sample config written"
+    echo "  Accel    → ARM toolchain + Python packages, optional host MCU build (Linux process)"
     echo "  KIAUH    → Ready at ~/kiauh/kiauh.sh"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
+    echo "  WiFi     → Power save off, MAC preserved, p2p0 disabled"
+    echo "  Fixes    → KlipperScreen screen_blanking, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
     echo "             systemd journal capped at 64MB"
     echo ""

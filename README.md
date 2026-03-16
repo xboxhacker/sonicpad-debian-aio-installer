@@ -11,11 +11,14 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | | What Gets Done |
 |---|---|
 | 🎥 **Nebula Camera** | Installs Crowsnest if missing, writes a working `crowsnest.conf` (YUYV/CPU, 1280x720 @ 15fps), and patches `ustreamer.sh` to stop MJPEG/HW auto-detection that conflicts with the SonicPad's EHCI USB controller |
-| 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, builds and flashes the Linux process MCU, creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
+| 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, optionally builds and flashes the Linux process MCU (y/n prompt), creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
-| 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager |
+| 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager (prefers 802-11-wireless over p2p for WiFi) |
+| 📶 **WiFi Stability** | Disables power save, preserves real MAC (no randomization), applies to existing connections. Reduces dropouts. |
+| 📶 **WiFi P2P Disabled** | Unmanages p2p0, udev rule brings it down, `p2p_disabled` in wpa_supplicant. KlipperScreen uses wlan0. |
+| 🔧 **Config Fixes** | KlipperScreen `screen_blanking` inline comments (incl. #~# section), moonraker.conf `/home/biqu/` → `/home/sonic/` |
 
 ---
 
@@ -192,7 +195,10 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 | Camera shows "No Signal" | Confirm `/dev/video0` exists: `ls /dev/video*`. If missing, the Nebula camera isn't detected at USB level — check the cable. |
 | `crowsnest.conf` not written | `~/printer_data/config` doesn't exist yet — install Moonraker via KIAUH first, then re-run the script. |
 | `ustreamer.sh` patch failed | Manually edit `~/crowsnest/libs/ustreamer.sh` around line 58 — change `-m MJPEG --encoder=HW` to `-m YUYV --encoder=CPU` |
-| `mcu rpi: Unable to open port` | `klipper-mcu` service isn't running. Check: `sudo systemctl status klipper-mcu` and `ls /tmp/klipper_host_mcu` |
+| `mcu rpi: Unable to open port` | `klipper-mcu` service isn't running. Check: `sudo systemctl status klipper-mcu` and `ls /tmp/klipper_host_mcu`. Build firmware: `cd ~/klipper && make menuconfig` (select Linux process), then `make && sudo make flash` |
+| Moonraker "can't connect to Klipper" | `klippy_uds_address` may point to `/home/biqu/`. Fix: `sed -i 's|/home/biqu/|/home/sonic/|g' ~/printer_data/config/moonraker.conf` then `sudo systemctl restart moonraker` |
+| KlipperScreen blank/crash | Check `screen_blanking` in KlipperScreen.conf — no inline comments. Fix: `sed -i 's/^\(screen_blanking:\s*\)\([0-9]*\).*/\1\2/' ~/printer_data/config/KlipperScreen.conf` and fix #~# section too |
+| WiFi drops constantly | Power save + MAC randomization cause this. Script fixes it. If still dropping: `nmcli connection modify "YourSSID" wifi-sec.key-mgmt wpa-psk` (disables FT-PSK) |
 | `Unable to open spi device` | spidev permissions not set. Run: `sudo chmod 666 /dev/spidev2.0` and verify udev rule exists at `/etc/udev/rules.d/99-spidev.rules` |
 | `Failed to import numpy` | numpy not in klippy-env or wrong version. Run: `sudo apt-get install -y libopenblas-dev && ~/klippy-env/bin/pip uninstall numpy -y && ~/klippy-env/bin/pip install "numpy<2"` |
 | numpy imports but SHAPER_CALIBRATE fails | scipy missing from klippy-env. Run: `~/klippy-env/bin/pip install scipy` |
@@ -202,6 +208,17 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.5.0
+- Added: Optional firmware build (y/n) — skip host MCU build if desired
+- Added: Linux process MCU config for firmware build — backs up printer config, sets CONFIG_MACH_LINUX, restores after flash
+- Added: WiFi stability — power save off, MAC preservation (no randomization), apply to existing connections
+- Added: WiFi P2P disabled — unmanage p2p0, udev rule brings it down, p2p_disabled in wpa_supplicant
+- Added: Static IP prefers 802-11-wireless over p2p, binds WiFi to wlan0
+- Added: fix_moonraker_biqu_path — corrects /home/biqu/ → /home/sonic/ in moonraker.conf
+- Added: fix_klipperscreen_config — strips inline comments from screen_blanking in [main] and #~# sections
+- Added: fix_sonic_path_env — adds /usr/sbin to PATH (rfkill, etc.)
+- Added: apt install usbutils, python3-serial, rfkill at script start
 
 ### v1.4.1
 - Added: Optional static IP configuration. Script prompts after hostname setup to configure static IP for Ethernet or WiFi via NetworkManager.
