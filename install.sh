@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.4"
+SCRIPT_VERSION="1.5.5"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -131,14 +131,30 @@ setup_static_ip() {
         return 0
     fi
 
+    local DEF_GW DEF_DNS DEF_CIDR DEF_IP DEF_PREFIX
+    DEF_GW=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')
+    DEF_DNS="${DEF_GW:-8.8.8.8}"
+    DEF_CIDR="24"
+    if [[ "${DEF_GW}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+        DEF_PREFIX="${BASH_REMATCH[1]}"
+        DEF_IP="${DEF_PREFIX}.102"
+    else
+        DEF_IP="192.168.1.102"
+    fi
+
     echo ""
     echo "  Using connection: ${CONN}"
-    echo "  Example: IP 192.168.1.100, Gateway 192.168.1.1, DNS 8.8.8.8"
+    echo "  Press ENTER to accept defaults shown in [brackets]."
     echo ""
-    read -p "  IP address (e.g. 192.168.1.100): " STATIC_IP
-    read -p "  CIDR prefix (e.g. 24 for /24): " STATIC_CIDR
-    read -p "  Gateway (e.g. 192.168.1.1): " STATIC_GW
-    read -p "  DNS server (e.g. 8.8.8.8): " STATIC_DNS
+    read -p "  IP address [${DEF_IP}]: " STATIC_IP
+    read -p "  CIDR prefix [${DEF_CIDR}]: " STATIC_CIDR
+    read -p "  Gateway [${DEF_GW:-192.168.1.1}]: " STATIC_GW
+    read -p "  DNS server [${DEF_DNS}]: " STATIC_DNS
+
+    STATIC_IP="${STATIC_IP:-${DEF_IP}}"
+    STATIC_CIDR="${STATIC_CIDR:-${DEF_CIDR}}"
+    STATIC_GW="${STATIC_GW:-${DEF_GW:-192.168.1.1}}"
+    STATIC_DNS="${STATIC_DNS:-${DEF_DNS}}"
 
     STATIC_IP=$(echo "${STATIC_IP}" | tr -d '[:space:]')
     STATIC_CIDR=$(echo "${STATIC_CIDR}" | tr -d '[:space:]')
@@ -764,7 +780,6 @@ ensure_wifi_connected() {
         sudo nmcli connection modify "${conn}" connection.interface-name wlan0 2>/dev/null || true
         sudo nmcli connection modify "${conn}" connection.autoconnect yes 2>/dev/null || true
         sudo nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address preserve 2>/dev/null || true
-        sudo nmcli connection modify "${conn}" wifi-sec.key-mgmt wpa-psk 2>/dev/null || true
         info "  Normalized WiFi profile: ${conn}"
     done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
 
@@ -909,7 +924,8 @@ fix_klipperscreen_wifi_p2p_ui() {
     # 1) Ignore unmanaged popup for p2p interfaces (indent-safe patch)
     # 2) Show actual active iface in IP label instead of selected wlan_device iface
     if [ -f "${sdbus_py}" ]; then
-        if python3 - "${sdbus_py}" << 'PY'
+        local py_patch_result=""
+        if py_patch_result=$(python3 - "${sdbus_py}" << 'PY'
 import re
 import sys
 from pathlib import Path
@@ -953,7 +969,7 @@ else:
     print("unchanged")
 PY
         then
-            if grep -q 'return f"{ip} ({iface_name})"' "${sdbus_py}" 2>/dev/null; then
+            if [ "${py_patch_result}" = "changed" ]; then
                 changed=true
                 ok "Patched sdbus_nm.py (p2p popup + IP label)."
             fi

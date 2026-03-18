@@ -211,6 +211,11 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 
 ## Changelog
 
+### v1.5.5
+- Changed: Static IP prompts now show defaults in brackets and accept ENTER to use them (no more mandatory manual typing for every field).
+- Changed: `ensure_wifi_connected` no longer forces `wifi-sec.key-mgmt wpa-psk` on all profiles, avoiding WPA3/SAE incompatibility.
+- Changed: `fix_klipperscreen_wifi_p2p_ui` only marks `sdbus_nm.py` as changed when the Python patcher actually edits the file.
+
 ### v1.5.4
 - Fixed: `fix_klipperscreen_wifi_p2p_ui` now patches `sdbus_nm.py` with an indentation-safe Python transformer instead of multiline `sed`, preventing `expected an indented block` syntax failures.
 
