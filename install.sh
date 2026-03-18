@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.7"
+SCRIPT_VERSION="1.5.9"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -169,8 +169,10 @@ setup_static_ip() {
     info "Applying static IP to ${CONN}..."
     # Bind WiFi connection to wlan0 (avoids p2p / WiFi Direct mode)
     [ "${DEVICE}" = "wlan0" ] && sudo nmcli connection modify "${CONN}" connection.interface-name wlan0
-    sudo nmcli connection modify "${CONN}" ipv4.method manual
+    # NetworkManager may reject setting method=manual before addresses exist.
+    # Set addresses first, then switch method to manual.
     sudo nmcli connection modify "${CONN}" ipv4.addresses "${STATIC_IP}/${STATIC_CIDR}"
+    sudo nmcli connection modify "${CONN}" ipv4.method manual
     [ -n "${STATIC_GW}" ] && sudo nmcli connection modify "${CONN}" ipv4.gateway "${STATIC_GW}"
     [ -n "${STATIC_DNS}" ] && sudo nmcli connection modify "${CONN}" ipv4.dns "${STATIC_DNS}"
 
@@ -760,12 +762,52 @@ ensure_wifi_connected() {
     local any_wifi=false
     local ssid=""
     local psk=""
+    local prompt_wifi_setup="N"
+    local forced_ssid="${WIFI_SSID:-}"
+    local forced_psk="${WIFI_PASSWORD:-}"
 
     info "Hardening WiFi profiles and attempting reconnect on wlan0..."
     sudo rfkill unblock all 2>/dev/null || true
     sudo nmcli radio wifi on 2>/dev/null || true
     sudo systemctl restart NetworkManager 2>/dev/null || true
     sleep 2
+
+    # Optional explicit WiFi credentials path:
+    # - Non-interactive: use WIFI_SSID/WIFI_PASSWORD env vars
+    # - Interactive: prompt user if they want to enter SSID/password now
+    if [ -n "${forced_ssid}" ] && [ -n "${forced_psk}" ]; then
+        ssid="${forced_ssid}"
+        psk="${forced_psk}"
+        prompt_wifi_setup="Y"
+        info "Using WiFi credentials from environment variables."
+    elif [ -t 0 ]; then
+        read -p "  Enter WiFi SSID/password now? [y/N]: " prompt_wifi_setup
+        case "${prompt_wifi_setup}" in
+            [Yy]*)
+                read -p "  WiFi SSID: " ssid
+                read -s -p "  WiFi Password: " psk
+                echo ""
+                ;;
+            *)
+                prompt_wifi_setup="N"
+                ;;
+        esac
+    fi
+
+    if [ "${prompt_wifi_setup}" = "Y" ] && [ -n "${ssid}" ] && [ -n "${psk}" ]; then
+        # Replace stale profile for this SSID with fresh credentials.
+        sudo nmcli connection delete "${ssid}" 2>/dev/null || true
+        if sudo nmcli device wifi connect "${ssid}" password "${psk}" ifname wlan0 2>/dev/null; then
+            ok "WiFi connected to ${ssid}."
+            conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: -v s="${ssid}" '$1==s && $2=="802-11-wireless" {print $1; exit}')
+            [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" connection.interface-name wlan0 2>/dev/null || true
+            [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" connection.autoconnect yes 2>/dev/null || true
+            [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address preserve 2>/dev/null || true
+            any_wifi=true
+        else
+            warn "WiFi connect failed for SSID '${ssid}'. Check password/security mode."
+        fi
+    fi
 
     # Remove stale WiFi Direct profiles — they can hijack wlan0 selection logic.
     while IFS= read -r conn; do

@@ -19,7 +19,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager (prefers 802-11-wireless over p2p for WiFi) |
 | 📶 **WiFi Stability** | Disables power save, preserves real MAC (no randomization), applies to existing connections. Reduces dropouts. |
 | 📶 **WiFi P2P Disabled** | Unmanages p2p0, udev rule brings it down, `p2p_disabled` in wpa_supplicant. KlipperScreen uses wlan0. |
-| 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically (optional SSID/password prompt if no saved profile exists) |
+| 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically (includes explicit SSID/password entry prompt and supports `WIFI_SSID`/`WIFI_PASSWORD` env vars) |
 | 🔧 **Config Fixes** | KlipperScreen `screen_blanking` inline comments (incl. #~# section), KlipperScreen WiFi UI p2p0 filtering/IP label fixes, moonraker.conf `/home/biqu/` → `/home/sonic/` |
 
 ---
@@ -210,6 +210,13 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.5.9
+- Added: explicit WiFi credential entry path in `ensure_wifi_connected` (prompted SSID/password input).
+- Added: non-interactive WiFi credential support via `WIFI_SSID` and `WIFI_PASSWORD` environment variables.
+
+### v1.5.8
+- Fixed: static IP application order in `setup_static_ip` (`ipv4.addresses` is now set before `ipv4.method manual`) to prevent NetworkManager error `this property cannot be empty for 'method=manual'`.
 
 ### v1.5.7
 - Changed: moved `setup_static_ip` later in the run (after WiFi profile normalization/reconnect) so fresh pads don't warn `No NetworkManager connection found for wlan0` before a profile exists.
