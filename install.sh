@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.9"
+SCRIPT_VERSION="1.6.0"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -687,17 +687,25 @@ fix_wifi_stability() {
     sudo mkdir -p /etc/NetworkManager/conf.d
     sudo tee "${nm_powersave}" > /dev/null << 'EOF'
 # Disable WiFi power management — prevents connection dropouts
-# Use real MAC address — MAC randomization causes 4-way handshake failures on some routers
+# Disable scan MAC randomization — can cause 4-way handshake failures on some routers
+# Do NOT set cloned-mac-address here: locally-administered MACs (02:xx) are silently
+# rejected by many routers. Let each connection use the driver's real hardware MAC.
 [connection]
 wifi.powersave = 2
-wifi.cloned-mac-address = preserve
 wifi.scan-rand-mac-address = no
 EOF
-    ok "WiFi power save and MAC preservation configured."
+    ok "WiFi power save configured."
     sudo systemctl reload NetworkManager 2>/dev/null || true
-    # Apply MAC preservation to existing WiFi connections (global default may not apply)
+
+    # Remove any locally-administered MAC overrides from existing connections.
+    # Routers silently drop probe/auth frames from 02:xx:xx MACs, causing
+    # "direct probe timed out" and "Wi-Fi network could not be found" failures.
     for conn in $(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1}'); do
-        nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address preserve 2>/dev/null && info "  Set preserve MAC for: ${conn}" || true
+        local cur_mac=""
+        cur_mac=$(nmcli -t -f 802-11-wireless.cloned-mac-address connection show "${conn}" 2>/dev/null | cut -d: -f2-)
+        if [ -n "${cur_mac}" ] && [ "${cur_mac}" != "--" ] && [ "${cur_mac}" != "permanent" ]; then
+            nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address "" 2>/dev/null && info "  Removed fake MAC override from: ${conn}" || true
+        fi
     done
     # iwconfig power off at boot — some drivers need this in addition to NM
     if [ -f /etc/rc.local ] && ! grep -q "iwconfig.*power" /etc/rc.local 2>/dev/null; then
@@ -769,6 +777,25 @@ ensure_wifi_connected() {
     info "Hardening WiFi profiles and attempting reconnect on wlan0..."
     sudo rfkill unblock all 2>/dev/null || true
     sudo nmcli radio wifi on 2>/dev/null || true
+
+    # xradio driver recovery: if wlan0 is missing or in DOWN/DORMANT state,
+    # reload the kernel module. The xradio_wlan driver wedges after repeated
+    # failed auth attempts (common when a locally-administered MAC was rejected).
+    if [ ! -d /sys/class/net/wlan0 ]; then
+        warn "wlan0 interface missing — attempting xradio driver recovery..."
+        sudo modprobe -r xradio_wlan 2>/dev/null || true
+        sleep 2
+        sudo modprobe xradio_wlan 2>/dev/null || true
+        sleep 3
+    elif ip link show wlan0 2>/dev/null | grep -q "state DOWN"; then
+        warn "wlan0 is DOWN — reloading xradio driver..."
+        sudo ip link set wlan0 down 2>/dev/null || true
+        sudo modprobe -r xradio_wlan 2>/dev/null || true
+        sleep 2
+        sudo modprobe xradio_wlan 2>/dev/null || true
+        sleep 3
+    fi
+
     sudo systemctl restart NetworkManager 2>/dev/null || true
     sleep 2
 
@@ -802,7 +829,6 @@ ensure_wifi_connected() {
             conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: -v s="${ssid}" '$1==s && $2=="802-11-wireless" {print $1; exit}')
             [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" connection.interface-name wlan0 2>/dev/null || true
             [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" connection.autoconnect yes 2>/dev/null || true
-            [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address preserve 2>/dev/null || true
             any_wifi=true
         else
             warn "WiFi connect failed for SSID '${ssid}'. Check password/security mode."
@@ -821,7 +847,6 @@ ensure_wifi_connected() {
         any_wifi=true
         sudo nmcli connection modify "${conn}" connection.interface-name wlan0 2>/dev/null || true
         sudo nmcli connection modify "${conn}" connection.autoconnect yes 2>/dev/null || true
-        sudo nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address preserve 2>/dev/null || true
         info "  Normalized WiFi profile: ${conn}"
     done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
 
@@ -846,6 +871,28 @@ ensure_wifi_connected() {
     if [ -n "${connected_conn}" ]; then
         ok "WiFi connected on wlan0 (${connected_conn})."
         return 0
+    fi
+
+    # xradio recovery: if reconnect failed, the driver may have wedged.
+    # Reload the module and retry once before falling through to interactive setup.
+    if [ ! -d /sys/class/net/wlan0 ] || ip link show wlan0 2>/dev/null | grep -qE "state (DOWN|DORMANT)"; then
+        warn "wlan0 lost after connection attempt — reloading xradio driver..."
+        sudo modprobe -r xradio_wlan 2>/dev/null || true
+        sleep 2
+        sudo modprobe xradio_wlan 2>/dev/null || true
+        sleep 3
+        sudo systemctl restart NetworkManager 2>/dev/null || true
+        sleep 2
+        conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1; exit}')
+        if [ -n "${conn}" ]; then
+            sudo nmcli connection up "${conn}" ifname wlan0 2>/dev/null || true
+            sleep 3
+        fi
+        connected_conn=$(nmcli -t -f DEVICE,STATE,CONNECTION device status 2>/dev/null | awk -F: '$1=="wlan0" && $2=="connected" {print $3; exit}')
+        if [ -n "${connected_conn}" ]; then
+            ok "WiFi connected on wlan0 after xradio recovery (${connected_conn})."
+            return 0
+        fi
     fi
 
     # Interactive fallback for first-time setup / no saved WiFi profile.
@@ -1352,7 +1399,7 @@ main() {
     echo "  KScreen  → Auto-updated from ~/KlipperScreen when clean git checkout"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
-    echo "  WiFi     → Power save off, MAC preserved, p2p0 disabled, auto-reconnect on wlan0"
+    echo "  WiFi     → Power save off, fake MAC removed, xradio recovery, p2p0 disabled, auto-reconnect"
     echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
     echo "             systemd journal capped at 64MB"

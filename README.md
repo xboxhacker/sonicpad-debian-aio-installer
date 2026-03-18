@@ -17,9 +17,9 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
 | 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager (prefers 802-11-wireless over p2p for WiFi) |
-| 📶 **WiFi Stability** | Disables power save, preserves real MAC (no randomization), applies to existing connections. Reduces dropouts. |
+| 📶 **WiFi Stability** | Disables power save and scan MAC randomization. Removes locally-administered (fake) MAC overrides that cause routers to silently reject connections. |
 | 📶 **WiFi P2P Disabled** | Unmanages p2p0, udev rule brings it down, `p2p_disabled` in wpa_supplicant. KlipperScreen uses wlan0. |
-| 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically (includes explicit SSID/password entry prompt and supports `WIFI_SSID`/`WIFI_PASSWORD` env vars) |
+| 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically. Includes xradio driver recovery (reload kernel module when wlan0 is wedged/missing), explicit SSID/password entry prompt, and `WIFI_SSID`/`WIFI_PASSWORD` env var support. |
 | 🔧 **Config Fixes** | KlipperScreen `screen_blanking` inline comments (incl. #~# section), KlipperScreen WiFi UI p2p0 filtering/IP label fixes, moonraker.conf `/home/biqu/` → `/home/sonic/` |
 
 ---
@@ -210,6 +210,12 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.6.0
+- Fixed: removed `cloned-mac-address = preserve` from global NetworkManager config and per-connection normalization — locally-administered MACs (`02:xx:xx`) are silently rejected by many routers, causing "direct probe timed out" and "Wi-Fi network could not be found" failures.
+- Added: fake MAC detection and removal — `fix_wifi_stability` now scans existing WiFi profiles and strips any non-permanent MAC overrides.
+- Added: xradio driver recovery in `ensure_wifi_connected` — if `wlan0` is missing or in DOWN/DORMANT state, the `xradio_wlan` kernel module is reloaded automatically before attempting reconnect.
+- Added: post-reconnect xradio recovery — if the first connection attempt wedges the driver, a second `modprobe` reload + retry cycle runs before falling through to interactive setup.
 
 ### v1.5.9
 - Added: explicit WiFi credential entry path in `ensure_wifi_connected` (prompted SSID/password input).
