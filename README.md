@@ -211,6 +211,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 
 ## Changelog
 
+### v1.5.4
+- Fixed: `fix_klipperscreen_wifi_p2p_ui` now patches `sdbus_nm.py` with an indentation-safe Python transformer instead of multiline `sed`, preventing `expected an indented block` syntax failures.
+
 ### v1.5.3
 - Added: `ensure_wifi_connected` — hardens wlan0 connectivity by removing stale `wifi-p2p` profiles, normalizing infrastructure profiles (`interface-name=wlan0`, autoconnect, preserve MAC), and attempting reconnect automatically with interactive fallback.
 

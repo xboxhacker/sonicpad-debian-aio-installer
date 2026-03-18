@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.5.4"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -906,21 +906,57 @@ fix_klipperscreen_wifi_p2p_ui() {
     fi
 
     # Patch ks_includes/sdbus_nm.py:
-    # 1) Ignore unmanaged popup for p2p interfaces
+    # 1) Ignore unmanaged popup for p2p interfaces (indent-safe patch)
     # 2) Show actual active iface in IP label instead of selected wlan_device iface
     if [ -f "${sdbus_py}" ]; then
-        if grep -q 'self.popup(f"{self.wlan_device.interface} is not managed by NetworkManager and cannot be controlled by this app")' "${sdbus_py}" 2>/dev/null; then
-            info "Patching KlipperScreen unmanaged p2p popup handling..."
-            sed -i 's|self.popup(f"{self.wlan_device.interface} is not managed by NetworkManager and cannot be controlled by this app")|if str(self.wlan_device.interface).startswith("p2p"):\n                logging.info(f"Ignoring unmanaged P2P interface: {self.wlan_device.interface}")\n            else:\n                self.popup(f"{self.wlan_device.interface} is not managed by NetworkManager and cannot be controlled by this app")|' "${sdbus_py}"
-            changed=true
-            ok "Patched sdbus_nm.py (ignore unmanaged p2p popup)."
-        fi
+        if python3 - "${sdbus_py}" << 'PY'
+import re
+import sys
+from pathlib import Path
 
-        if grep -q 'return f"{ip} ({self.wlan_device.interface})"' "${sdbus_py}" 2>/dev/null; then
-            info "Patching KlipperScreen IP label to show active interface..."
-            sed -i 's|return f"{ip} ({self.wlan_device.interface})"|return f"{ip} ({iface_name})"|' "${sdbus_py}"
-            changed=true
-            ok "Patched sdbus_nm.py (IP label uses active iface)."
+p = Path(sys.argv[1])
+src = p.read_text(encoding="utf-8")
+out = src
+changed = False
+
+# Replace popup line with an indent-aware block.
+popup_pat = re.compile(
+    r'^(?P<indent>\s*)self\.popup\(f"\{self\.wlan_device\.interface\} is not managed by NetworkManager and cannot be controlled by this app"\)\s*$',
+    re.MULTILINE,
+)
+
+def popup_repl(m):
+    indent = m.group("indent")
+    return (
+        f'{indent}if str(self.wlan_device.interface).startswith("p2p"):\n'
+        f'{indent}    logging.info(f"Ignoring unmanaged P2P interface: {{self.wlan_device.interface}}")\n'
+        f'{indent}else:\n'
+        f'{indent}    self.popup(f"{{self.wlan_device.interface}} is not managed by NetworkManager and cannot be controlled by this app")'
+    )
+
+new_out, n = popup_pat.subn(popup_repl, out, count=1)
+if n:
+    out = new_out
+    changed = True
+
+# Fix IP label to use active interface name.
+ip_old = 'return f"{ip} ({self.wlan_device.interface})"'
+ip_new = 'return f"{ip} ({iface_name})"'
+if ip_old in out:
+    out = out.replace(ip_old, ip_new, 1)
+    changed = True
+
+if changed:
+    p.write_text(out, encoding="utf-8")
+    print("changed")
+else:
+    print("unchanged")
+PY
+        then
+            if grep -q 'return f"{ip} ({iface_name})"' "${sdbus_py}" 2>/dev/null; then
+                changed=true
+                ok "Patched sdbus_nm.py (p2p popup + IP label)."
+            fi
         fi
     fi
 
