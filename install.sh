@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.6"
+SCRIPT_VERSION="1.5.7"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -1273,7 +1273,7 @@ main() {
     echo "       vm.swappiness, CPU governor, tmpfs, noatime, Klipper priority,"
     echo "       disable unused services"
     echo "  [5] Log Rotation (Klipper, Moonraker, Crowsnest, journal cap)"
-    echo "  [*] Static IP (optional, prompted after hostname)"
+    echo "  [*] Static IP (optional, prompted after WiFi profile setup)"
     echo ""
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
@@ -1285,7 +1285,6 @@ main() {
     stop_klipper_services
     preflight_check
     setup_hostname
-    setup_static_ip
 
     setup_nebula_camera
     setup_accelerometer
@@ -1296,6 +1295,7 @@ main() {
     fix_wifi_stability
     fix_wifi_p2p
     ensure_wifi_connected
+    setup_static_ip
     fix_moonraker_biqu_path
     fix_klipperscreen_config
     fix_klipperscreen_wifi_p2p_ui
