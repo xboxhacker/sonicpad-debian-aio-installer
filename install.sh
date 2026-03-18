@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -733,6 +733,102 @@ EOF
 }
 
 # =============================================================================
+# FIX: WiFi reconnect hardening for multi-pad setups
+# =============================================================================
+# Ensures infrastructure WiFi profiles target wlan0, removes stale wifi-p2p
+# profiles, and attempts an automatic reconnect. If no profile exists and the
+# script is interactive, optionally prompts for SSID/password.
+ensure_wifi_connected() {
+    local connected_conn=""
+    local conn=""
+    local any_wifi=false
+    local ssid=""
+    local psk=""
+
+    info "Hardening WiFi profiles and attempting reconnect on wlan0..."
+    sudo rfkill unblock all 2>/dev/null || true
+    sudo nmcli radio wifi on 2>/dev/null || true
+    sudo systemctl restart NetworkManager 2>/dev/null || true
+    sleep 2
+
+    # Remove stale WiFi Direct profiles — they can hijack wlan0 selection logic.
+    while IFS= read -r conn; do
+        [ -z "${conn}" ] && continue
+        sudo nmcli connection delete "${conn}" 2>/dev/null && info "  Removed stale wifi-p2p profile: ${conn}" || true
+    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="wifi-p2p" {print $1}')
+
+    # Normalize all infrastructure WiFi profiles for SonicPad behavior.
+    while IFS= read -r conn; do
+        [ -z "${conn}" ] && continue
+        any_wifi=true
+        sudo nmcli connection modify "${conn}" connection.interface-name wlan0 2>/dev/null || true
+        sudo nmcli connection modify "${conn}" connection.autoconnect yes 2>/dev/null || true
+        sudo nmcli connection modify "${conn}" 802-11-wireless.cloned-mac-address preserve 2>/dev/null || true
+        sudo nmcli connection modify "${conn}" wifi-sec.key-mgmt wpa-psk 2>/dev/null || true
+        info "  Normalized WiFi profile: ${conn}"
+    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
+
+    # If already connected on wlan0, we are done.
+    connected_conn=$(nmcli -t -f DEVICE,STATE,CONNECTION device status 2>/dev/null | awk -F: '$1=="wlan0" && $2=="connected" {print $3; exit}')
+    if [ -n "${connected_conn}" ]; then
+        ok "WiFi already connected on wlan0 (${connected_conn})."
+        return 0
+    fi
+
+    # Attempt reconnect using saved infrastructure profile.
+    conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1; exit}')
+    if [ -n "${conn}" ]; then
+        info "Reconnecting WiFi profile: ${conn}"
+        sudo nmcli connection down "${conn}" 2>/dev/null || true
+        sleep 1
+        sudo nmcli connection up "${conn}" ifname wlan0 2>/dev/null || true
+        sleep 2
+    fi
+
+    connected_conn=$(nmcli -t -f DEVICE,STATE,CONNECTION device status 2>/dev/null | awk -F: '$1=="wlan0" && $2=="connected" {print $3; exit}')
+    if [ -n "${connected_conn}" ]; then
+        ok "WiFi connected on wlan0 (${connected_conn})."
+        return 0
+    fi
+
+    # Interactive fallback for first-time setup / no saved WiFi profile.
+    if [ "${any_wifi}" = false ] && [ -t 0 ]; then
+        echo ""
+        read -p "  No saved WiFi profile found. Connect wlan0 now? [Y/n]: " DO_WIFI_SETUP
+        DO_WIFI_SETUP="${DO_WIFI_SETUP:-Y}"
+        case "${DO_WIFI_SETUP}" in
+            [Yy]*)
+                read -p "  WiFi SSID: " ssid
+                read -s -p "  WiFi Password: " psk
+                echo ""
+                if [ -n "${ssid}" ] && [ -n "${psk}" ]; then
+                    if sudo nmcli device wifi connect "${ssid}" password "${psk}" ifname wlan0 2>/dev/null; then
+                        ok "WiFi connected to ${ssid}."
+                        conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: -v s="${ssid}" '$1==s && $2=="802-11-wireless" {print $1; exit}')
+                        [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" connection.interface-name wlan0 2>/dev/null || true
+                        [ -n "${conn}" ] && sudo nmcli connection modify "${conn}" connection.autoconnect yes 2>/dev/null || true
+                    else
+                        warn "WiFi connect failed for SSID '${ssid}'. Check password/security mode."
+                    fi
+                else
+                    warn "SSID/password not provided. Skipping interactive WiFi setup."
+                fi
+                ;;
+            *)
+                info "Skipping interactive WiFi setup."
+                ;;
+        esac
+    fi
+
+    connected_conn=$(nmcli -t -f DEVICE,STATE,CONNECTION device status 2>/dev/null | awk -F: '$1=="wlan0" && $2=="connected" {print $3; exit}')
+    if [ -n "${connected_conn}" ]; then
+        ok "WiFi connected on wlan0 (${connected_conn})."
+    else
+        warn "wlan0 still disconnected. Check logs: journalctl -u NetworkManager -n 120 --no-pager"
+    fi
+}
+
+# =============================================================================
 # FIX: Moonraker klippy_uds_address (biqu -> sonic path)
 # =============================================================================
 # Some configs reference /home/biqu/ (Biqu pad) but SonicPad uses /home/sonic/.
@@ -1146,6 +1242,7 @@ main() {
     setup_logrotate
     fix_wifi_stability
     fix_wifi_p2p
+    ensure_wifi_connected
     fix_moonraker_biqu_path
     fix_klipperscreen_config
     fix_klipperscreen_wifi_p2p_ui
@@ -1160,7 +1257,7 @@ main() {
     echo "  KScreen  → Auto-updated from ~/KlipperScreen when clean git checkout"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
-    echo "  WiFi     → Power save off, MAC preserved, p2p0 disabled"
+    echo "  WiFi     → Power save off, MAC preserved, p2p0 disabled, auto-reconnect on wlan0"
     echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
     echo "             systemd journal capped at 64MB"

@@ -19,6 +19,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager (prefers 802-11-wireless over p2p for WiFi) |
 | 📶 **WiFi Stability** | Disables power save, preserves real MAC (no randomization), applies to existing connections. Reduces dropouts. |
 | 📶 **WiFi P2P Disabled** | Unmanages p2p0, udev rule brings it down, `p2p_disabled` in wpa_supplicant. KlipperScreen uses wlan0. |
+| 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically (optional SSID/password prompt if no saved profile exists) |
 | 🔧 **Config Fixes** | KlipperScreen `screen_blanking` inline comments (incl. #~# section), KlipperScreen WiFi UI p2p0 filtering/IP label fixes, moonraker.conf `/home/biqu/` → `/home/sonic/` |
 
 ---
@@ -209,6 +210,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.5.3
+- Added: `ensure_wifi_connected` — hardens wlan0 connectivity by removing stale `wifi-p2p` profiles, normalizing infrastructure profiles (`interface-name=wlan0`, autoconnect, preserve MAC), and attempting reconnect automatically with interactive fallback.
 
 ### v1.5.2
 - Added: `update_klipperscreen` — auto-updates `~/KlipperScreen` via `git pull --ff-only` when installed as a clean git checkout; safely skips on local changes/non-git checkout.
