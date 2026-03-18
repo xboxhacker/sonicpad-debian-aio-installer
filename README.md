@@ -211,6 +211,9 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 
 ## Changelog
 
+### v1.5.6
+- Fixed: installer shell syntax in `fix_klipperscreen_wifi_p2p_ui` (`unexpected EOF while looking for matching ')'`) by closing the Python command substitution correctly.
+
 ### v1.5.5
 - Changed: Static IP prompts now show defaults in brackets and accept ENTER to use them (no more mandatory manual typing for every field).
 - Changed: `ensure_wifi_connected` no longer forces `wifi-sec.key-mgmt wpa-psk` on all profiles, avoiding WPA3/SAE incompatibility.

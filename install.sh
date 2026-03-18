@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.5.5"
+SCRIPT_VERSION="1.5.6"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -968,6 +968,7 @@ if changed:
 else:
     print("unchanged")
 PY
+)
         then
             if [ "${py_patch_result}" = "changed" ]; then
                 changed=true
