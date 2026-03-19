@@ -646,110 +646,7 @@ setup_kiauh() {
 }
 
 
-# =============================================================================
-# FIX: Unique persistent MAC for wlan0 (avoids duplicate MACs across pads)
-# =============================================================================
-# Multiple SonicPads share the same xradio driver-assigned MAC (addr_assign_type=3).
-# We generate a unique MAC that keeps the original Creality OUI prefix (so the
-# router accepts it) but makes the last 3 bytes unique per pad, derived from
-# /etc/machine-id. The MAC is saved to /etc/wlan0-mac so it's the same every boot.
-setup_unique_mac() {
-    banner "Unique WiFi MAC Setup"
 
-    local mac_file="/etc/wlan0-mac"
-    local script="/usr/local/bin/set-wlan0-mac.sh"
-    local service="/etc/systemd/system/set-wlan0-mac.service"
-
-    # Generate a persistent unique MAC if one doesn't exist yet.
-    if [ -f "${mac_file}" ] && grep -qE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' "${mac_file}" 2>/dev/null; then
-        ok "Unique MAC already generated: $(cat "${mac_file}")"
-    else
-        info "Generating unique MAC for this pad..."
-
-        # Read the driver's OUI prefix (first 3 bytes)
-        local hw_mac=""
-        hw_mac=$(cat /sys/class/net/wlan0/address 2>/dev/null || echo "fc:ee:92:00:00:00")
-        local oui="${hw_mac:0:8}"
-
-        # Derive unique last 3 bytes from machine-id + hostname
-        local seed=""
-        seed=$(cat /etc/machine-id 2>/dev/null)$(hostname)
-        local hash=""
-        hash=$(echo -n "${seed}" | md5sum | cut -c1-6)
-        local b4="${hash:0:2}"
-        local b5="${hash:2:2}"
-        local b6="${hash:4:2}"
-
-        local new_mac="${oui}:${b4}:${b5}:${b6}"
-        echo "${new_mac}" | sudo tee "${mac_file}" > /dev/null
-        ok "Generated unique MAC: ${new_mac} (saved to ${mac_file})"
-    fi
-
-    info "Creating MAC setter script..."
-    sudo tee "${script}" > /dev/null << 'SCRIPT'
-#!/bin/bash
-# Apply persistent unique MAC to wlan0 before NetworkManager starts.
-# Keeps the Creality OUI prefix so the router accepts it.
-
-IFACE="wlan0"
-MAC_FILE="/etc/wlan0-mac"
-MAX_WAIT=10
-WAITED=0
-
-[ -f "${MAC_FILE}" ] || exit 0
-NEW_MAC=$(cat "${MAC_FILE}")
-[ -n "${NEW_MAC}" ] || exit 0
-
-# Wait for the xradio driver to create wlan0
-while [ ! -d "/sys/class/net/${IFACE}" ] && [ "${WAITED}" -lt "${MAX_WAIT}" ]; do
-    sleep 1
-    WAITED=$((WAITED + 1))
-done
-
-if [ ! -d "/sys/class/net/${IFACE}" ]; then
-    echo "set-mac: ${IFACE} not found after ${MAX_WAIT}s, skipping" >&2
-    exit 0
-fi
-
-CURRENT_MAC=$(cat "/sys/class/net/${IFACE}/address" 2>/dev/null)
-if [ "${CURRENT_MAC}" = "${NEW_MAC}" ]; then
-    exit 0
-fi
-
-ip link set "${IFACE}" down 2>/dev/null
-ip link set "${IFACE}" address "${NEW_MAC}" 2>/dev/null
-ip link set "${IFACE}" up 2>/dev/null
-SCRIPT
-    sudo chmod +x "${script}"
-    ok "MAC setter script created at ${script}."
-
-    info "Creating systemd service..."
-    sudo tee "${service}" > /dev/null << 'EOF'
-[Unit]
-Description=Set unique persistent MAC on wlan0
-Before=NetworkManager.service
-After=sys-subsystem-net-devices-wlan0.device
-Wants=sys-subsystem-net-devices-wlan0.device
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/set-wlan0-mac.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable set-wlan0-mac.service 2>/dev/null
-
-    # Disable the old randomizer service if it exists
-    sudo systemctl disable randomize-wlan0-mac.service 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/randomize-wlan0-mac.service 2>/dev/null
-    sudo rm -f /usr/local/bin/randomize-wlan0-mac.sh 2>/dev/null
-
-    ok "Unique MAC service enabled (applies before NetworkManager on every boot)."
-}
 
 # =============================================================================
 # FIX: Ensure network is up before Klipper/Moonraker start
@@ -1484,7 +1381,6 @@ main() {
     setup_kiauh
     setup_os_tuning
     setup_logrotate
-    setup_unique_mac
     fix_wifi_stability
     fix_wifi_p2p
     ensure_wifi_connected
@@ -1504,7 +1400,7 @@ main() {
     echo "  KScreen  → P2P UI patches applied (no auto-update — avoids breaking local patches)"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
-    echo "  WiFi     → Unique MAC (same OUI), power save off, xradio recovery, p2p0 disabled"
+    echo "  WiFi     → Power save off, xradio recovery, p2p0 disabled, auto-reconnect"
     echo "  Boot     → Klipper/Moonraker wait for network before starting"
     echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
