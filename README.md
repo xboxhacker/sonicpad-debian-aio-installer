@@ -20,6 +20,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | 📶 **WiFi Stability** | Disables power save and scan MAC randomization. Removes locally-administered (fake) MAC overrides that cause routers to silently reject connections. |
 | 📶 **WiFi P2P Disabled** | Unmanages p2p0, udev rule brings it down, `p2p_disabled` in wpa_supplicant. KlipperScreen uses wlan0. |
 | 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically. Includes xradio driver recovery (reload kernel module when wlan0 is wedged/missing), explicit SSID/password entry prompt, and `WIFI_SSID`/`WIFI_PASSWORD` env var support. |
+| 🔄 **Boot Order** | Klipper and Moonraker wait for network (`NetworkManager-wait-online`) before starting — ensures WiFi is connected and the web UI is reachable immediately after boot. |
 | 🔧 **Config Fixes** | KlipperScreen `screen_blanking` inline comments (incl. #~# section), KlipperScreen WiFi UI p2p0 filtering/IP label fixes, moonraker.conf `/home/biqu/` → `/home/sonic/` |
 
 ---
@@ -217,6 +218,7 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 - Added: xradio driver recovery in `ensure_wifi_connected` — if `wlan0` is missing or in DOWN/DORMANT state, the `xradio_wlan` kernel module is reloaded automatically before attempting reconnect.
 - Added: post-reconnect xradio recovery — if the first connection attempt wedges the driver, a second `modprobe` reload + retry cycle runs before falling through to interactive setup.
 - Removed: `update_klipperscreen` auto-updater — pulling new KlipperScreen code would overwrite the p2p UI patches and could break compatibility with BDsensor or other modified Klipper modules.
+- Added: `fix_service_network_deps` — Klipper and Moonraker now wait for `NetworkManager-wait-online.service` before starting, ensuring WiFi is connected and the web UI is reachable immediately after boot.
 
 ### v1.5.9
 - Added: explicit WiFi credential entry path in `ensure_wifi_connected` (prompted SSID/password input).

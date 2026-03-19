@@ -647,6 +647,34 @@ setup_kiauh() {
 
 
 # =============================================================================
+# FIX: Ensure network is up before Klipper/Moonraker start
+# =============================================================================
+# Without this, Klipper and Moonraker can start before WiFi connects on boot,
+# making the web UI (Mainsail/Fluidd) unreachable until services are restarted.
+fix_service_network_deps() {
+    info "Ensuring Klipper and Moonraker wait for network on boot..."
+
+    sudo systemctl enable NetworkManager-wait-online.service 2>/dev/null || true
+
+    sudo mkdir -p /etc/systemd/system/klipper.service.d
+    sudo tee /etc/systemd/system/klipper.service.d/network.conf > /dev/null << 'EOF'
+[Unit]
+After=NetworkManager-wait-online.service
+Wants=NetworkManager-wait-online.service
+EOF
+
+    sudo mkdir -p /etc/systemd/system/moonraker.service.d
+    sudo tee /etc/systemd/system/moonraker.service.d/network.conf > /dev/null << 'EOF'
+[Unit]
+After=NetworkManager-wait-online.service
+Wants=NetworkManager-wait-online.service
+EOF
+
+    sudo systemctl daemon-reload
+    ok "Klipper and Moonraker will wait for network before starting."
+}
+
+# =============================================================================
 # FIX: WiFi stability (power save off, MAC preservation, prevent dropouts)
 # =============================================================================
 # Logs showed: 4-way handshake -> disconnected, "no secrets", MAC randomization.
@@ -1354,6 +1382,7 @@ main() {
     fix_wifi_stability
     fix_wifi_p2p
     ensure_wifi_connected
+    fix_service_network_deps
     setup_static_ip
     fix_moonraker_biqu_path
     fix_klipperscreen_config
@@ -1370,6 +1399,7 @@ main() {
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
     echo "  WiFi     → Power save off, fake MAC removed, xradio recovery, p2p0 disabled, auto-reconnect"
+    echo "  Boot     → Klipper/Moonraker wait for network before starting"
     echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
     echo "             systemd journal capped at 64MB"
