@@ -17,6 +17,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
 | 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager (prefers 802-11-wireless over p2p for WiFi) |
+| 📶 **MAC Randomizer** | Installs `macchanger` and a systemd service that assigns a unique random vendor MAC to `wlan0` on every boot (before NetworkManager starts). Uses `-A` to pick from real vendor OUIs — avoids locally-administered `02:xx` MACs that routers silently reject. Prevents duplicate-MAC conflicts across multiple SonicPads. |
 | 📶 **WiFi Stability** | Disables power save and scan MAC randomization. Removes locally-administered (fake) MAC overrides that cause routers to silently reject connections. |
 | 📶 **WiFi P2P Disabled** | Unmanages p2p0, udev rule brings it down, `p2p_disabled` in wpa_supplicant. KlipperScreen uses wlan0. |
 | 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically. Includes xradio driver recovery (reload kernel module when wlan0 is wedged/missing), explicit SSID/password entry prompt, and `WIFI_SSID`/`WIFI_PASSWORD` env var support. |
@@ -219,6 +220,7 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 - Added: post-reconnect xradio recovery — if the first connection attempt wedges the driver, a second `modprobe` reload + retry cycle runs before falling through to interactive setup.
 - Removed: `update_klipperscreen` auto-updater — pulling new KlipperScreen code would overwrite the p2p UI patches and could break compatibility with BDsensor or other modified Klipper modules.
 - Added: `fix_service_network_deps` — Klipper and Moonraker now wait for `NetworkManager-wait-online.service` before starting, ensuring WiFi is connected and the web UI is reachable immediately after boot.
+- Added: `setup_mac_randomizer` — installs `macchanger` and a systemd oneshot service that assigns a unique random vendor MAC (`macchanger -A`) to `wlan0` on every boot, before NetworkManager starts. Prevents duplicate-MAC conflicts across pads without using locally-administered MACs.
 
 ### v1.5.9
 - Added: explicit WiFi credential entry path in `ensure_wifi_connected` (prompted SSID/password input).

@@ -647,6 +647,85 @@ setup_kiauh() {
 
 
 # =============================================================================
+# FIX: Randomize wlan0 MAC at boot (avoids duplicate MACs across pads)
+# =============================================================================
+# Multiple SonicPads share the same xradio driver-assigned MAC (addr_assign_type=3).
+# macchanger -A picks a real vendor OUI from its database — this avoids the
+# locally-administered bit (02:xx) that many routers silently reject.
+setup_mac_randomizer() {
+    banner "WiFi MAC Randomizer Setup"
+
+    info "Installing macchanger..."
+    sudo apt-get install -y macchanger -qq 2>/dev/null || {
+        # Non-interactive install — macchanger asks if it should auto-run
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y macchanger -qq 2>/dev/null || {
+            warn "macchanger install failed. Skipping MAC randomizer."
+            return 0
+        }
+    }
+    ok "macchanger installed."
+
+    local script="/usr/local/bin/randomize-wlan0-mac.sh"
+    local service="/etc/systemd/system/randomize-wlan0-mac.service"
+
+    info "Creating MAC randomizer script..."
+    sudo tee "${script}" > /dev/null << 'SCRIPT'
+#!/bin/bash
+# Randomize wlan0 MAC before NetworkManager starts.
+# Uses -A to pick a real vendor OUI (avoids locally-administered 02:xx MACs
+# that many routers silently reject).
+
+IFACE="wlan0"
+MAX_WAIT=10
+WAITED=0
+
+# Wait for the xradio driver to create wlan0
+while [ ! -d "/sys/class/net/${IFACE}" ] && [ "${WAITED}" -lt "${MAX_WAIT}" ]; do
+    sleep 1
+    WAITED=$((WAITED + 1))
+done
+
+if [ ! -d "/sys/class/net/${IFACE}" ]; then
+    echo "randomize-mac: ${IFACE} not found after ${MAX_WAIT}s, skipping" >&2
+    exit 0
+fi
+
+ip link set "${IFACE}" down 2>/dev/null
+macchanger -A "${IFACE}" 2>/dev/null
+ip link set "${IFACE}" up 2>/dev/null
+SCRIPT
+    sudo chmod +x "${script}"
+    ok "Randomizer script created at ${script}."
+
+    info "Creating systemd service..."
+    sudo tee "${service}" > /dev/null << 'EOF'
+[Unit]
+Description=Randomize wlan0 MAC address at boot
+Before=NetworkManager.service
+After=sys-subsystem-net-devices-wlan0.device
+Wants=sys-subsystem-net-devices-wlan0.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/randomize-wlan0-mac.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable randomize-wlan0-mac.service 2>/dev/null
+    ok "MAC randomizer service enabled (runs before NetworkManager on every boot)."
+
+    # Run it now so the current session gets a fresh MAC
+    info "Applying random MAC to wlan0 now..."
+    sudo ip link set wlan0 down 2>/dev/null || true
+    sudo macchanger -A wlan0 2>/dev/null && ok "wlan0 MAC randomized." || warn "macchanger failed — will apply on next boot."
+    sudo ip link set wlan0 up 2>/dev/null || true
+}
+
+# =============================================================================
 # FIX: Ensure network is up before Klipper/Moonraker start
 # =============================================================================
 # Without this, Klipper and Moonraker can start before WiFi connects on boot,
@@ -1366,9 +1445,9 @@ main() {
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
     require_sudo
-    info "Updating package lists and installing usbutils, python3-serial, rfkill..."
+    info "Updating package lists and installing usbutils, python3-serial, rfkill, macchanger..."
     sudo apt update
-    sudo apt install -y usbutils python3-serial rfkill
+    DEBIAN_FRONTEND=noninteractive sudo apt install -y usbutils python3-serial rfkill macchanger
     fix_ssl
     stop_klipper_services
     preflight_check
@@ -1379,6 +1458,7 @@ main() {
     setup_kiauh
     setup_os_tuning
     setup_logrotate
+    setup_mac_randomizer
     fix_wifi_stability
     fix_wifi_p2p
     ensure_wifi_connected
@@ -1398,7 +1478,7 @@ main() {
     echo "  KScreen  → P2P UI patches applied (no auto-update — avoids breaking local patches)"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
-    echo "  WiFi     → Power save off, fake MAC removed, xradio recovery, p2p0 disabled, auto-reconnect"
+    echo "  WiFi     → MAC randomized (vendor OUI), power save off, xradio recovery, p2p0 disabled"
     echo "  Boot     → Klipper/Moonraker wait for network before starting"
     echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
