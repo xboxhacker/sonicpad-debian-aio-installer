@@ -647,37 +647,58 @@ setup_kiauh() {
 
 
 # =============================================================================
-# FIX: Randomize wlan0 MAC at boot (avoids duplicate MACs across pads)
+# FIX: Unique persistent MAC for wlan0 (avoids duplicate MACs across pads)
 # =============================================================================
 # Multiple SonicPads share the same xradio driver-assigned MAC (addr_assign_type=3).
-# macchanger -A picks a real vendor OUI from its database — this avoids the
-# locally-administered bit (02:xx) that many routers silently reject.
-setup_mac_randomizer() {
-    banner "WiFi MAC Randomizer Setup"
+# We generate a unique MAC that keeps the original Creality OUI prefix (so the
+# router accepts it) but makes the last 3 bytes unique per pad, derived from
+# /etc/machine-id. The MAC is saved to /etc/wlan0-mac so it's the same every boot.
+setup_unique_mac() {
+    banner "Unique WiFi MAC Setup"
 
-    info "Installing macchanger..."
-    sudo apt-get install -y macchanger -qq 2>/dev/null || {
-        # Non-interactive install — macchanger asks if it should auto-run
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y macchanger -qq 2>/dev/null || {
-            warn "macchanger install failed. Skipping MAC randomizer."
-            return 0
-        }
-    }
-    ok "macchanger installed."
+    local mac_file="/etc/wlan0-mac"
+    local script="/usr/local/bin/set-wlan0-mac.sh"
+    local service="/etc/systemd/system/set-wlan0-mac.service"
 
-    local script="/usr/local/bin/randomize-wlan0-mac.sh"
-    local service="/etc/systemd/system/randomize-wlan0-mac.service"
+    # Generate a persistent unique MAC if one doesn't exist yet.
+    if [ -f "${mac_file}" ] && grep -qE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' "${mac_file}" 2>/dev/null; then
+        ok "Unique MAC already generated: $(cat "${mac_file}")"
+    else
+        info "Generating unique MAC for this pad..."
 
-    info "Creating MAC randomizer script..."
+        # Read the driver's OUI prefix (first 3 bytes)
+        local hw_mac=""
+        hw_mac=$(cat /sys/class/net/wlan0/address 2>/dev/null || echo "fc:ee:92:00:00:00")
+        local oui="${hw_mac:0:8}"
+
+        # Derive unique last 3 bytes from machine-id + hostname
+        local seed=""
+        seed=$(cat /etc/machine-id 2>/dev/null)$(hostname)
+        local hash=""
+        hash=$(echo -n "${seed}" | md5sum | cut -c1-6)
+        local b4="${hash:0:2}"
+        local b5="${hash:2:2}"
+        local b6="${hash:4:2}"
+
+        local new_mac="${oui}:${b4}:${b5}:${b6}"
+        echo "${new_mac}" | sudo tee "${mac_file}" > /dev/null
+        ok "Generated unique MAC: ${new_mac} (saved to ${mac_file})"
+    fi
+
+    info "Creating MAC setter script..."
     sudo tee "${script}" > /dev/null << 'SCRIPT'
 #!/bin/bash
-# Randomize wlan0 MAC before NetworkManager starts.
-# Uses -A to pick a real vendor OUI (avoids locally-administered 02:xx MACs
-# that many routers silently reject).
+# Apply persistent unique MAC to wlan0 before NetworkManager starts.
+# Keeps the Creality OUI prefix so the router accepts it.
 
 IFACE="wlan0"
+MAC_FILE="/etc/wlan0-mac"
 MAX_WAIT=10
 WAITED=0
+
+[ -f "${MAC_FILE}" ] || exit 0
+NEW_MAC=$(cat "${MAC_FILE}")
+[ -n "${NEW_MAC}" ] || exit 0
 
 # Wait for the xradio driver to create wlan0
 while [ ! -d "/sys/class/net/${IFACE}" ] && [ "${WAITED}" -lt "${MAX_WAIT}" ]; do
@@ -686,28 +707,33 @@ while [ ! -d "/sys/class/net/${IFACE}" ] && [ "${WAITED}" -lt "${MAX_WAIT}" ]; d
 done
 
 if [ ! -d "/sys/class/net/${IFACE}" ]; then
-    echo "randomize-mac: ${IFACE} not found after ${MAX_WAIT}s, skipping" >&2
+    echo "set-mac: ${IFACE} not found after ${MAX_WAIT}s, skipping" >&2
+    exit 0
+fi
+
+CURRENT_MAC=$(cat "/sys/class/net/${IFACE}/address" 2>/dev/null)
+if [ "${CURRENT_MAC}" = "${NEW_MAC}" ]; then
     exit 0
 fi
 
 ip link set "${IFACE}" down 2>/dev/null
-macchanger -A "${IFACE}" 2>/dev/null
+ip link set "${IFACE}" address "${NEW_MAC}" 2>/dev/null
 ip link set "${IFACE}" up 2>/dev/null
 SCRIPT
     sudo chmod +x "${script}"
-    ok "Randomizer script created at ${script}."
+    ok "MAC setter script created at ${script}."
 
     info "Creating systemd service..."
     sudo tee "${service}" > /dev/null << 'EOF'
 [Unit]
-Description=Randomize wlan0 MAC address at boot
+Description=Set unique persistent MAC on wlan0
 Before=NetworkManager.service
 After=sys-subsystem-net-devices-wlan0.device
 Wants=sys-subsystem-net-devices-wlan0.device
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/randomize-wlan0-mac.sh
+ExecStart=/usr/local/bin/set-wlan0-mac.sh
 RemainAfterExit=yes
 
 [Install]
@@ -715,14 +741,14 @@ WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
-    sudo systemctl enable randomize-wlan0-mac.service 2>/dev/null
-    ok "MAC randomizer service enabled (runs before NetworkManager on every boot)."
+    sudo systemctl enable set-wlan0-mac.service 2>/dev/null
 
-    # Run it now so the current session gets a fresh MAC
-    info "Applying random MAC to wlan0 now..."
-    sudo ip link set wlan0 down 2>/dev/null || true
-    sudo macchanger -A wlan0 2>/dev/null && ok "wlan0 MAC randomized." || warn "macchanger failed — will apply on next boot."
-    sudo ip link set wlan0 up 2>/dev/null || true
+    # Disable the old randomizer service if it exists
+    sudo systemctl disable randomize-wlan0-mac.service 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/randomize-wlan0-mac.service 2>/dev/null
+    sudo rm -f /usr/local/bin/randomize-wlan0-mac.sh 2>/dev/null
+
+    ok "Unique MAC service enabled (applies before NetworkManager on every boot)."
 }
 
 # =============================================================================
@@ -1445,9 +1471,9 @@ main() {
     read -p "  Press ENTER to continue or Ctrl+C to cancel..." _
 
     require_sudo
-    info "Updating package lists and installing usbutils, python3-serial, rfkill, macchanger..."
+    info "Updating package lists and installing usbutils, python3-serial, rfkill..."
     sudo apt update
-    DEBIAN_FRONTEND=noninteractive sudo apt install -y usbutils python3-serial rfkill macchanger
+    sudo apt install -y usbutils python3-serial rfkill
     fix_ssl
     stop_klipper_services
     preflight_check
@@ -1458,7 +1484,7 @@ main() {
     setup_kiauh
     setup_os_tuning
     setup_logrotate
-    setup_mac_randomizer
+    setup_unique_mac
     fix_wifi_stability
     fix_wifi_p2p
     ensure_wifi_connected
@@ -1478,7 +1504,7 @@ main() {
     echo "  KScreen  → P2P UI patches applied (no auto-update — avoids breaking local patches)"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
-    echo "  WiFi     → MAC randomized (vendor OUI), power save off, xradio recovery, p2p0 disabled"
+    echo "  WiFi     → Unique MAC (same OUI), power save off, xradio recovery, p2p0 disabled"
     echo "  Boot     → Klipper/Moonraker wait for network before starting"
     echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
