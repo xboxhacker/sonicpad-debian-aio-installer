@@ -13,7 +13,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | 🎥 **Nebula Camera** | Installs Crowsnest if missing, writes a working `crowsnest.conf` (YUYV/CPU, 1280x720 @ 15fps), and patches `ustreamer.sh` to stop MJPEG/HW auto-detection that conflicts with the SonicPad's EHCI USB controller |
 | 📈 **Accelerometer** | Installs `libopenblas-dev` (required by numpy on ARM), installs `numpy<2` and `scipy` into the klippy virtualenv, optionally builds and flashes the Linux process MCU (y/n prompt), creates `klipper-mcu.service`, sets permanent `spidev2.0` permissions via udev, and drops a ready-to-use `adxl345_sample.cfg` |
 | 🛠️ **KIAUH** | Clones the [Klipper Installation And Update Helper](https://github.com/dw-0/kiauh) so you can install Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, and Crowsnest interactively |
-| 🖥️ **KlipperScreen Update** | If `~/KlipperScreen` exists as a clean git checkout, script runs `git pull --ff-only` automatically before applying KlipperScreen compatibility patches |
+| 🖥️ **KlipperScreen Patches** | Applies p2p UI fixes to KlipperScreen (no auto-update — avoids overwriting local patches or breaking BDsensor/other module compatibility) |
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
 | 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager (prefers 802-11-wireless over p2p for WiFi) |
@@ -216,6 +216,7 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 - Added: fake MAC detection and removal — `fix_wifi_stability` now scans existing WiFi profiles and strips any non-permanent MAC overrides.
 - Added: xradio driver recovery in `ensure_wifi_connected` — if `wlan0` is missing or in DOWN/DORMANT state, the `xradio_wlan` kernel module is reloaded automatically before attempting reconnect.
 - Added: post-reconnect xradio recovery — if the first connection attempt wedges the driver, a second `modprobe` reload + retry cycle runs before falling through to interactive setup.
+- Removed: `update_klipperscreen` auto-updater — pulling new KlipperScreen code would overwrite the p2p UI patches and could break compatibility with BDsensor or other modified Klipper modules.
 
 ### v1.5.9
 - Added: explicit WiFi credential entry path in `ensure_wifi_connected` (prompted SSID/password input).

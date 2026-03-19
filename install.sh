@@ -645,35 +645,6 @@ setup_kiauh() {
     info "Use KIAUH to install/update: Klipper, Moonraker, Mainsail, Fluidd, KlipperScreen, Crowsnest."
 }
 
-# =============================================================================
-# SECTION 3.1: KlipperScreen Update (if installed)
-# =============================================================================
-update_klipperscreen() {
-    local ks_dir="/home/sonic/KlipperScreen"
-
-    if [ ! -d "${ks_dir}" ]; then
-        info "KlipperScreen not found at ${ks_dir}. Skipping update."
-        return 0
-    fi
-    if [ ! -d "${ks_dir}/.git" ]; then
-        warn "KlipperScreen exists but is not a git checkout. Skipping auto-update."
-        return 0
-    fi
-
-    info "Updating KlipperScreen (git pull --ff-only)..."
-
-    # Do not auto-pull if user has local modifications in KlipperScreen repo.
-    if ! git -C "${ks_dir}" diff --quiet 2>/dev/null || ! git -C "${ks_dir}" diff --cached --quiet 2>/dev/null; then
-        warn "KlipperScreen has local changes. Skipping update to avoid overwriting edits."
-        return 0
-    fi
-
-    if git -C "${ks_dir}" pull --ff-only 2>/dev/null; then
-        ok "KlipperScreen updated."
-    else
-        warn "KlipperScreen update failed (non-fast-forward/network issue). Continuing."
-    fi
-}
 
 # =============================================================================
 # FIX: WiFi stability (power save off, MAC preservation, prevent dropouts)
@@ -1378,7 +1349,6 @@ main() {
     setup_nebula_camera
     setup_accelerometer
     setup_kiauh
-    update_klipperscreen
     setup_os_tuning
     setup_logrotate
     fix_wifi_stability
@@ -1396,7 +1366,7 @@ main() {
     echo "  Camera   → crowsnest.conf written, ustreamer.sh patched (YUYV/CPU, 1280x720)"
     echo "  Accel    → ARM toolchain + Python packages, optional host MCU build (Linux process)"
     echo "  KIAUH    → Ready at ~/kiauh/kiauh.sh"
-    echo "  KScreen  → Auto-updated from ~/KlipperScreen when clean git checkout"
+    echo "  KScreen  → P2P UI patches applied (no auto-update — avoids breaking local patches)"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
     echo "  WiFi     → Power save off, fake MAC removed, xradio recovery, p2p0 disabled, auto-reconnect"
