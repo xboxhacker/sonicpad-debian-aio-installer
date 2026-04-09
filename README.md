@@ -17,6 +17,7 @@ Automates the most common post-flash configuration tasks in a single run — no 
 | ⚡ **OS Performance Tuning** | `vm.swappiness=10` to keep Klipper in RAM, CPU governor forced to `performance` for step timing stability, `tmpfs` on `/tmp` (with `mode=1777` for Xorg compatibility), `noatime` on root filesystem, Klipper process priority boosted (`nice=-10`), and unused system services disabled |
 | 🗂️ **Log Rotation** | `logrotate` configs for Klipper, Moonraker, Crowsnest (daily, 5-day retention, gzip compressed), plus systemd journal capped at 64MB to protect SD card longevity |
 | 🌐 **Static IP** | Optional. Prompts to configure static IP for Ethernet or WiFi via NetworkManager (prefers 802-11-wireless over p2p for WiFi) |
+| 📶 **Optional MAC Randomization** | Prompted as `y/N`. If enabled, installs `macchanger` and randomizes `wlan0` MAC at each boot before NetworkManager starts. If disabled, any prior MAC-randomization services are removed. |
 | 📶 **WiFi Stability** | Disables power save and scan MAC randomization. Removes locally-administered (fake) MAC overrides that cause routers to silently reject connections. |
 | 📶 **WiFi P2P Disabled** | Unmanages p2p0, udev rule brings it down, `p2p_disabled` in wpa_supplicant. KlipperScreen uses wlan0. |
 | 📶 **WiFi Auto-Reconnect** | Normalizes WiFi profiles to `wlan0`, removes stale `wifi-p2p` profiles, enables autoconnect, and attempts reconnect automatically. Includes xradio driver recovery (reload kernel module when wlan0 is wedged/missing), explicit SSID/password entry prompt, and `WIFI_SSID`/`WIFI_PASSWORD` env var support. |
@@ -211,6 +212,11 @@ The accelerometer setup on the SonicPad has several non-obvious requirements tha
 ---
 
 ## Changelog
+
+### v1.6.1
+- Added: optional `y/N` prompt for WiFi MAC randomization (`setup_optional_mac_randomizer`).
+- Added: automatic setup/removal logic for `randomize-wlan0-mac.service` depending on user choice.
+- Changed: script version bumped to `1.6.1`.
 
 ### v1.6.0
 - Fixed: removed `cloned-mac-address = preserve` from global NetworkManager config and per-connection normalization — locally-administered MACs (`02:xx:xx`) are silently rejected by many routers, causing "direct probe timed out" and "Wi-Fi network could not be found" failures.

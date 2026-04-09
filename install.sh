@@ -14,7 +14,7 @@
 # Errors handled explicitly — set -e removed to prevent exit on non-fatal failures
 set -uo pipefail
 
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 CROWSNEST_DIR="/home/sonic/crowsnest"
 PRINTER_DATA="/home/sonic/printer_data"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -647,6 +647,78 @@ setup_kiauh() {
 
 
 
+
+# =============================================================================
+# FIX: Optional MAC randomization for wlan0
+# =============================================================================
+# Some users want per-boot randomized MAC addresses. Keep this opt-in because
+# certain routers/APs use MAC allow-lists and will reject changed addresses.
+setup_optional_mac_randomizer() {
+    banner "Optional WiFi MAC Randomization"
+
+    local do_randomize="N"
+    local script="/usr/local/bin/randomize-wlan0-mac.sh"
+    local service="/etc/systemd/system/randomize-wlan0-mac.service"
+
+    if [ -t 0 ]; then
+        read -p "  Randomize wlan0 MAC address at each boot? [y/N]: " do_randomize
+    fi
+
+    case "${do_randomize}" in
+        [Yy]*)
+            info "Installing macchanger for optional MAC randomization..."
+            DEBIAN_FRONTEND=noninteractive sudo apt-get install -y macchanger -qq 2>/dev/null || {
+                warn "macchanger install failed. Skipping optional MAC randomization."
+                return 0
+            }
+
+            sudo tee "${script}" > /dev/null << 'SCRIPT'
+#!/bin/bash
+# Randomize wlan0 MAC before NetworkManager starts.
+# Uses fully-random MAC mode on user request.
+IFACE="wlan0"
+MAX_WAIT=10
+WAITED=0
+
+while [ ! -d "/sys/class/net/${IFACE}" ] && [ "${WAITED}" -lt "${MAX_WAIT}" ]; do
+    sleep 1
+    WAITED=$((WAITED + 1))
+done
+
+[ -d "/sys/class/net/${IFACE}" ] || exit 0
+ip link set "${IFACE}" down 2>/dev/null
+macchanger -r "${IFACE}" 2>/dev/null
+ip link set "${IFACE}" up 2>/dev/null
+SCRIPT
+            sudo chmod +x "${script}"
+
+            sudo tee "${service}" > /dev/null << 'EOF'
+[Unit]
+Description=Randomize wlan0 MAC address at boot (optional)
+Before=NetworkManager.service
+After=sys-subsystem-net-devices-wlan0.device
+Wants=sys-subsystem-net-devices-wlan0.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/randomize-wlan0-mac.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            sudo systemctl daemon-reload
+            sudo systemctl enable randomize-wlan0-mac.service 2>/dev/null || true
+            ok "Optional MAC randomization enabled."
+            ;;
+        *)
+            info "Skipping optional MAC randomization."
+            sudo systemctl disable randomize-wlan0-mac.service 2>/dev/null || true
+            sudo rm -f "${service}" "${script}" /etc/wlan0-mac /etc/systemd/system/set-wlan0-mac.service /usr/local/bin/set-wlan0-mac.sh 2>/dev/null
+            sudo systemctl daemon-reload 2>/dev/null || true
+            ;;
+    esac
+}
 
 # =============================================================================
 # FIX: Ensure network is up before Klipper/Moonraker start
@@ -1381,6 +1453,7 @@ main() {
     setup_kiauh
     setup_os_tuning
     setup_logrotate
+    setup_optional_mac_randomizer
     fix_wifi_stability
     fix_wifi_p2p
     ensure_wifi_connected
@@ -1400,7 +1473,7 @@ main() {
     echo "  KScreen  → P2P UI patches applied (no auto-update — avoids breaking local patches)"
     echo "  OS Tune  → swappiness=10, CPU governor=performance, tmpfs /tmp + /var/log,"
     echo "             noatime on root fs, Klipper nice=-10, unused services disabled"
-    echo "  WiFi     → Power save off, xradio recovery, p2p0 disabled, auto-reconnect"
+    echo "  WiFi     → Optional MAC randomization (y/N), power save off, xradio recovery"
     echo "  Boot     → Klipper/Moonraker wait for network before starting"
     echo "  Fixes    → KlipperScreen screen_blanking + p2p UI, moonraker biqu→sonic path"
     echo "  Logs     → logrotate configured for Klipper, Moonraker, Crowsnest"
